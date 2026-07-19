@@ -1,0 +1,15 @@
+# Rust build output (default + the isolated per-scenario target dirs).
+/rust/target/
+/rust/target-*/
+
+# Compiled demo/example binaries produced by the Makefile.
+/sable
+/sable-portable
+/sable-http
+/sable-rust2go
+/sable-amd64
+/sable-*
+
+# Go test/coverage artifacts. (Fuzz corpus under testdata/ IS committed.)
+*.test
+*.out

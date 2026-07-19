@@ -1,0 +1,108 @@
+name: sable CI
+
+# Operationalizes the internal-ABI commitment (see README "Supported Go toolchains"):
+#   * verify — full suite on every CERTIFIED Go version × arch.
+#   * go-tip — early-warning tripwire for the NEXT Go release (allowed to fail).
+#
+# When `go-tip` starts failing, a coming Go release breaks an internal we rely
+# on: run `make abi-check` locally on it to see which canary, and fix/adapt
+# before it lands in a stable release.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 6 * * 1" # weekly, to catch tip drift even without commits
+  workflow_dispatch:
+
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        # Keep in sync with SupportedGoVersions in guard.go.
+        go: ["1.26.4"]
+        runner: [ubuntu-24.04, ubuntu-24.04-arm] # amd64 + arm64 native
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "${{ matrix.go }}"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Full verify (abi-check + suite + safe variant + http)
+        run: make verify-all
+
+  # Concurrency + memory-safety cores (see README "Verification"). Arch-independent,
+  # so one runner suffices.
+  verification:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Loom — model-check the await-slot wakeup protocol (all interleavings)
+        run: make loom
+      - name: Fuzz — the Call FFI byte-buffer boundary (bounded)
+        run: make fuzz FUZZTIME=60s
+      - name: Archive any fuzz failure corpus
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: testdata/fuzz/
+
+  # Miri UB-check of the Call pointer lifecycle. Nightly — allowed to fail if a
+  # nightly regresses; the invariants it checks are also exercised under stable
+  # `cargo test` (minus UB instrumentation).
+  miri:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - name: Miri — UB/leak/double-free check of the Call ABI pointer lifecycle
+        run: make miri
+
+  # Real rust2go integration (examples/rust2go.md): rust2go's g2r typed crossing
+  # onto Sable's fused runtime. Opt-in; the generated Go binding is committed, so
+  # this needs only the crate + Go module (no rust2go-cli). Allowed to fail — it
+  # depends on an external Go module that can drift independently of Sable.
+  rust2go:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build + test the real rust2go binding (relaxed cgo checks, as rust2go requires)
+        env:
+          SABLE_ALLOW_UNVERIFIED_GO: "1"
+        run: make test-rust2go
+
+  # Tripwire: does the code still build/certify on Go tip? Allowed to fail.
+  go-tip:
+    runs-on: ubuntu-24.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+      - name: Install gotip
+        run: |
+          go install golang.org/dl/gotip@latest
+          gotip download
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Certify Go tip (canaries only; unverified ABI is expected)
+        env:
+          SABLE_ALLOW_UNVERIFIED_GO: "1"
+        run: |
+          cargo build --release --manifest-path rust/Cargo.toml
+          gotip test -race -count=1 -run '^TestCanary' -v .

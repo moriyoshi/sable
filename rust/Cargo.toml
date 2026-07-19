@@ -1,0 +1,91 @@
+[package]
+name = "sable"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "sable"
+# staticlib -> libsable.a, absorbed into the cgo binary for a single static output.
+# rlib -> lets an embedder's OWN staticlib crate depend on sable as a Rust
+# library (S-5), building one combined lib (imbh + sable runtime + handlers).
+# Producing both is free; sable's own Go link still uses libsable.a.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# M1 baseline uses a normal tokio runtime with IO enabled (its own mio epoll).
+# `net` pulls in AsyncFd (tokio::io::unix), used for the "tokio task awaits Go"
+# direction. M2 will build the runtime WITHOUT enable_io() so tokio owns no
+# epoll; the feature staying compiled-in is harmless (a reactor only exists if
+# enable_io() is called at runtime).
+# M2+ uses a current-thread runtime with ONLY time enabled (no enable_io ->
+# tokio owns no epoll). `sync` provides the oneshot used to stop the executor
+# thread. `net` (AsyncFd) is no longer needed once fused fds move to Go's
+# netpoll, but kept for reference/bisecting against M1.
+tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
+libc = "0.2"
+# Go-M-driven executor (see rust/src/goexec.rs): async-task lets Go worker
+# goroutines poll tokio-style tasks (task scheduling across Go's M:N scheduler).
+async-task = "4"
+crossbeam-queue = "0.3"
+
+# Optional real-world scenario: reqwest (async HTTP client) + axum (async HTTP
+# server) running on a SEPARATE io-enabled tokio runtime, sharing sable's
+# completion delivery. Gated behind `--features http` (heavy dep tree) and the
+# Go build tag `sable_http`. Plain HTTP only (no TLS) => reqwest default-features
+# off, keeping the tree lean and avoiding openssl.
+reqwest = { version = "0.12", default-features = false, optional = true }
+axum = { version = "0.7", default-features = false, features = ["tokio", "http1"], optional = true }
+# Real rust2go crate (macro + typed marshalling). No `build` feature => no
+# bindgen; the g2r macro emits the C exports inline, compiled into libsable.a.
+rust2go = { version = "0.4", optional = true }
+
+[features]
+default = ["fast", "demo"]
+# `fast` gates the deep-integration paths (reactor/pump, goexec, inline). Build
+# with --no-default-features for the PORTABLE core (zero linkname on the Rust
+# side): spawn + doorbell only. See SUPPORTED.md.
+fast = []
+# `demo` compiles the built-in byte Call ops (echo/upper/.../check_stock) and the
+# S-2 demo handle op, used by sable's demos/examples/tests. An embedder that owns
+# its own S-1 registry builds WITHOUT it (default-features = false) to pull only
+# the runtime core. On by default so sable's own suite is unchanged.
+demo = []
+# `multithread` (S-4.2): offer an IO-DISABLED multi-thread executor
+# (new_multi_thread().enable_time(), NO enable_io) for CPU-heavy handlers
+# (DataFusion) that need real parallelism. The claim it preserves the single-
+# epoll invariant is validated empirically — see the s4_epoll_tests in lib.rs.
+# Opt-in: pulls tokio's multi-thread scheduler.
+multithread = ["tokio/rt-multi-thread"]
+http = ["dep:reqwest", "dep:axum", "tokio/rt-multi-thread", "tokio/net", "tokio/io-util"]
+# Real rust2go integration (examples/rust2go.md): rust2go's g2r typed asm crossing
+# kicks off an async task that runs on Sable's fused runtime. Heavy (own Go
+# module dep + arch asm), so opt-in and built into a SEPARATE target dir.
+rust2go = ["dep:rust2go"]
+
+# Pure-tokio baseline (no Go, no fusion) to quantify the fusion overhead.
+# Built only with --features http (reuses the already-compiled dep tree).
+[[bin]]
+name = "pure_bench"
+required-features = ["http"]
+
+[profile.release]
+# Keep symbols; we link this into a cgo binary and want clean nm output.
+opt-level = 3
+lto = false
+# panic = "unwind" (the default): required so the FFI-boundary catch_unwind
+# firewalls in later milestones can convert a Rust panic into an error code
+# instead of unwinding into Go (which is UB / aborts).
+
+[dev-dependencies]
+# The S-4.2 epoll control test binds a real socket to force tokio's IO driver to
+# create its epoll (proving the epoll is IO-driver-sourced, not scheduler-
+# sourced). `net` + `rt-multi-thread` are test-only here.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "macros", "sync", "net"] }
+
+[target.'cfg(loom)'.dev-dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow", check-cfg = ['cfg(loom)'] }
