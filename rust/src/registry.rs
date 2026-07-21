@@ -14,18 +14,64 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex};
 
+/// An opaque, owned handle: a raw pointer plus a release callback. **Freed on
+/// drop unless disarmed** (via [`Handle::into_raw`]). This is what makes the
+/// handle path leak-safe on every path: a `Payload::Handle` dropped as a buffered
+/// batch at cursor close, held by an aborted producer, or misrouted to the byte
+/// path releases its pointer exactly once instead of leaking. sable never
+/// inspects `ptr`; on the delivery path ownership is transferred to Go (which
+/// disarms the drop and drives the release itself).
+pub struct Handle {
+    ptr: u64,
+    release: unsafe extern "C" fn(u64),
+    armed: bool,
+}
+
+// `ptr` is opaque and `release` is a plain fn pointer — safe to move across
+// threads (e.g. onto a multi-thread executor's workers).
+unsafe impl Send for Handle {}
+
+impl Handle {
+    /// Wrap a raw pointer + its release callback. `ptr` should be non-null (0 is
+    /// the "no handle" sentinel on the completion wire).
+    pub fn new(ptr: u64, release: unsafe extern "C" fn(u64)) -> Self {
+        Self { ptr, release, armed: true }
+    }
+
+    /// The raw pointer (does not transfer ownership).
+    pub fn ptr(&self) -> u64 {
+        self.ptr
+    }
+
+    /// Disarm and return `(ptr, release)`: the caller takes over the single free
+    /// and this `Handle`'s own `Drop` becomes a no-op.
+    pub(crate) fn into_raw(mut self) -> (u64, unsafe extern "C" fn(u64)) {
+        self.armed = false;
+        (self.ptr, self.release)
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        if self.armed && self.ptr != 0 {
+            unsafe { (self.release)(self.ptr) };
+        }
+    }
+}
+
 /// A handler's successful payload.
 pub enum Payload {
     /// Owned response bytes — the classic Call path (`sable_call` / `sable_call_result`).
     Bytes(Vec<u8>),
-    /// An opaque handle Go takes ownership of on the zero-copy path (S-2). sable
-    /// delivers `ptr` as the `u64` completion result and, if Go never takes it
-    /// (shutdown / abort / never-taken), calls `release(ptr)` exactly once.
-    /// `ptr` MUST be non-null (0 is the "no handle" sentinel on the wire).
-    Handle {
-        ptr: u64,
-        release: unsafe extern "C" fn(u64),
-    },
+    /// An opaque handle Go takes ownership of on the zero-copy path (S-2/S-3).
+    Handle(Handle),
+}
+
+impl Payload {
+    /// Convenience: build a `Payload::Handle` from a raw pointer + release fn.
+    pub fn handle(ptr: u64, release: unsafe extern "C" fn(u64)) -> Self {
+        Payload::Handle(Handle::new(ptr, release))
+    }
 }
 
 /// A handler's result: an [`Payload`] on success, or error bytes.

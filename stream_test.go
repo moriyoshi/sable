@@ -5,13 +5,19 @@ package sable
 // early-close (cancel).
 
 import (
+	"context"
 	"testing"
+	"time"
 	"unsafe"
 )
 
 // OpStreamDemo is the demo stream op (Rust `demo` feature): emits req[0] batches,
 // each a boxed u64 handle (0xB000 + i).
 const OpStreamDemo uint32 = 40
+
+// OpStreamStall is a demo stream that never emits — a Next on it parks until the
+// cursor is cancelled or closed.
+const OpStreamStall uint32 = 41
 
 func TestStreamFullDrain(t *testing.T) {
 	Init()
@@ -66,4 +72,54 @@ func TestStreamUnknownOp(t *testing.T) {
 	if _, err := OpenStream(9999, nil); err != ErrNoStream {
 		t.Fatalf("OpenStream(unknown) err = %v, want ErrNoStream", err)
 	}
+}
+
+// TestStreamNextCtxCancel: a Next parked on a stalled stream is unparked promptly
+// when its ctx is cancelled from another goroutine (A).
+func TestStreamNextCtxCancel(t *testing.T) {
+	Init()
+	s, err := OpenStream(OpStreamStall, nil)
+	if err != nil {
+		t.Fatalf("OpenStream: %v", err)
+	}
+	defer s.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(20 * time.Millisecond); cancel() }()
+	start := time.Now()
+	ptr, ok := s.NextCtx(ctx)
+	if ok {
+		demoHandleFree(ptr)
+		t.Fatal("NextCtx returned a batch from a stalled stream")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("ctx not cancelled")
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("cancel did not unpark Next promptly (%v)", d)
+	}
+}
+
+// TestOpenStreamBackpressure: with a cap of 1, a second live stream is refused
+// until the first is closed (C) — the admission slot is held for the stream's
+// lifetime.
+func TestOpenStreamBackpressure(t *testing.T) {
+	Init()
+	SetMaxInFlight(1)
+	defer SetMaxInFlight(0)
+
+	s1, err := OpenStream(OpStreamStall, nil) // holds the one slot
+	if err != nil {
+		t.Fatalf("first OpenStream: %v", err)
+	}
+	if _, err := OpenStream(OpStreamStall, nil); err != ErrBackpressure {
+		s1.Close()
+		t.Fatalf("second OpenStream err = %v, want ErrBackpressure", err)
+	}
+	s1.Close() // releases the slot
+
+	s3, err := OpenStream(OpStreamStall, nil)
+	if err != nil {
+		t.Fatalf("OpenStream after close: %v", err)
+	}
+	s3.Close()
 }

@@ -129,33 +129,42 @@ existing `(token, u64)` completion and touch neither the doorbell, the park stat
 machine, nor the single-epoll invariant.
 
 - **Pluggable handler registry (Rust: `register` / `register_stream`).** Instead of
-  a compiled-in `dispatch`, the embedder registers `op → async handler` before
-  `Init`. A handler is any `Fn(Vec<u8>) -> impl Future<Output = HandlerResult>`;
-  `Call`/`CallCtx`/`TryCall` look up the registry first and fall back to the demo
-  ops (gated behind the `demo` feature). The demo ops are just one registrant.
+  a compiled-in `dispatch`, the embedder registers `op → async handler`. A handler
+  is any `Fn(Vec<u8>) -> impl Future<Output = HandlerResult>`; `Call`/`CallCtx`/
+  `TryCall` look up the registry first and fall back to the demo ops (gated behind
+  the `demo` feature). The demo ops are just one registrant.
 
   ```rust
   sable::register(OP_QUERY, |req| async move { run_query(req).await });   // Ok(Payload::Bytes) | Err(bytes)
   ```
 
-- **Zero-copy handle result (`CallHandle`).** A handler may return
-  `Payload::Handle { ptr, release }` — an opaque pointer (e.g. a
+  **Registration contract.** Handlers are registered from Rust (in the combined
+  staticlib crate), and registration must happen **before the first Call** for that
+  op — typically from an exported init the binding's Go calls before `sable.Init`.
+  An unregistered op is not a crash: it returns a normal error (`"unknown op N"`) on
+  every path, so a missed registration surfaces as a clear error, not UB.
+
+- **Zero-copy handle result (`CallHandle`, `CallHandleCtx`).** A handler may return
+  `Payload::handle(ptr, release)` — an opaque pointer (e.g. a
   `*mut FFI_ArrowArrayStream`) sable delivers verbatim as the `u64` result. Go takes
   ownership with `CallHandle`, which disarms sable's **release-on-drop net** (a
   `token → release` map swept on shutdown, mirroring the cancellation guard) so the
   pointer is freed exactly once — by Go on the normal path, by sable if Go never
-  takes it. A `0` result is the "no handle" sentinel (handler errored).
+  takes it. On a `0` result the handler's **error is delivered without re-running**
+  the op (`sable_call_handle_error`). `CallHandleCtx` adds ctx cancellation.
 
   ```go
   ptr, err := sable.CallHandle(OP_QUERY, req)   // ptr is Go-owned; drive its own release (e.g. cdata)
   ```
 
-- **Streaming call (`OpenStream` / `Stream.Next` / `Close`).** For results that must
-  not be materialized whole, a stream handler is a producer that pushes each batch
-  into a bounded channel; Go opens a server-side cursor and pulls **one batch per
-  await** — the goroutine parks between batches, so async `get_next` needs no
-  `block_on` and blocks no M. The bounded channel is the backpressure; `Close` aborts
-  the producer (dropping whatever it pinned) and releases buffered batches.
+- **Streaming call (`OpenStream` / `Stream.Next` / `NextCtx` / `Close`).** For results
+  that must not be materialized whole, a stream handler is a producer that pushes
+  each batch into a bounded channel; Go opens a server-side cursor and pulls **one
+  batch per await** — the goroutine parks between batches, so async `get_next` needs
+  no `block_on` and blocks no M. The bounded channel is the backpressure; `OpenStream`
+  is additionally admission-controlled (`SetMaxInFlight` caps concurrent live
+  streams, returning `ErrBackpressure`). `NextCtx` cancels a parked pull; `Close`
+  aborts the producer (dropping whatever it pinned) and releases buffered batches.
 
   ```go
   s, _ := sable.OpenStream(OP_QUERY, req)
@@ -190,8 +199,9 @@ The pointer is invalid the instant `sable_call_free` runs; the returned `[]byte`
 an independent Go allocation.
 
 **Opaque handle — single owner, single free, with a safety net.** A handler returns
-`Payload::Handle { ptr, release }`; sable records `token → (ptr, release)` **before**
-delivering `ptr`, so the pointer is always accounted for. Then exactly one of:
+`Payload::handle(ptr, release)` (a self-releasing `Handle`); sable records
+`token → (ptr, release)` **before** delivering `ptr`, so the pointer is always
+accounted for. Then exactly one of:
 
 - *Taken* — `CallHandle` calls `sable_call_handle_taken(token)`, which drops the map
   entry **without** calling `release`. Go now solely owns `ptr` and must drive its
@@ -203,8 +213,12 @@ delivering `ptr`, so the pointer is always accounted for. Then exactly one of:
 
 The contract: **take before teardown** any handle you intend to use. `handle_taken`
 and the shutdown sweep are mutually exclusive (taken removes the entry), so a handle
-is freed once and only once. A `0` result means the handler produced no handle;
-nothing is armed and `handle_taken` must not be called.
+is freed once and only once. A `0` result means no handle: nothing is armed and
+`handle_taken` must not be called — the handler's error is retrievable without
+re-running the op via `sable_call_handle_error` (or, for `CallHandleCtx`, `0` +
+`ctx.Err()` means cancelled). And because `Handle` releases on drop, a `Payload`
+that is *never* delivered — dropped as a buffered batch, held by an aborted
+producer, or misrouted to the byte path — still frees its pointer exactly once.
 
 **Stream batches — the handle rules, per batch, plus close/drain.** Each batch is a
 `Payload::Handle` flowing through a bounded channel; `Stream.Next` delivers it armed
@@ -466,10 +480,11 @@ the http scenario (uses `tokio::net`, so two epolls) nor goexec.
 **Embedding surface is built; typed codegen is not.** The Call path is now a
 user-populated registry (`register` / `register_stream`) that delivers bytes,
 opaque handles, or lazy streams (see [above](#embedding-pluggable-handlers-opaque-handles--streaming)).
-Still open: a **typed codegen layer** (uniffi-style) over the byte transport; the
-**reverse direction** (Rust awaits a Go handler) is symmetric in principle but not
-built out; and on the handle path an error currently arrives as the `0` sentinel
-(the caller re-reads the error via the byte `Call`) rather than inline.
+Handle and stream paths are cancellable (`CallHandleCtx` / `Stream.NextCtx`),
+carry handler errors without re-running (`sable_call_handle_error`), and streams
+are admission-controlled (`SetMaxInFlight`). Still open: a **typed codegen layer**
+(uniffi-style) over the byte transport, and the **reverse direction** (Rust awaits
+a Go handler), symmetric in principle but not built out.
 
 **Cancellation is one-directional.** The reverse direction (Rust cancelling a Go
 operation) and distinguishing a handler panic from a cancel are remaining refinements.
@@ -727,6 +742,8 @@ stream.go                  streaming Call: OpenStream / Stream.Next / Close
 demohandle.go              demo handle release wrapper (!sable_extern_lib)
 link_default.go            cgo LDFLAGS: link sable's own libsable.a (default)
 link_extern.go             cgo LDFLAGS: embedder supplies the lib (-tags sable_extern_lib)
+runtime_default.go         single-thread executor ctor (default)
+runtime_multithread.go     multi-thread executor ctor (-tags sable_multithread)
 stats.go, shutdown.go      observability snapshot; graceful teardown
 api.go, api_fast.go        public API: Init, Await*, RuntimePtr, …
 trampoline.go              asmcgocall fast path (default)

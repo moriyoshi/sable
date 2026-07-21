@@ -85,6 +85,13 @@ void sable_call_free(uint64_t handle);
  *     release-on-drop net calls the handler's release exactly once. --- */
 void sable_call_handle(const SableRuntime *rt, uint32_t op, const uint8_t *req, size_t req_len, uint64_t token);
 void sable_call_handle_taken(uint64_t token);
+/* Cancellable handle path: sable_call_cancel(token) aborts the in-flight op,
+ * delivering 0 (the caller reports its ctx error). */
+void sable_call_handle_ctx(const SableRuntime *rt, uint32_t op, const uint8_t *req, size_t req_len, uint64_t token);
+/* On a 0 handle result, retrieve the handler's error WITHOUT re-running the op:
+ * returns a CallResult handle (read via sable_call_result + sable_call_free) or 0
+ * if the 0 was a cancellation / genuine no-handle. Removes the entry (call once). */
+uint64_t sable_call_handle_error(uint64_t token);
 
 /* Demo/test only (Rust `demo` feature): free a handle produced by the demo
  * handle op — the caller's stand-in for driving a real handle's own release. */
@@ -92,17 +99,25 @@ void sable_demo_handle_free(uint64_t ptr);
 
 /* --- S-3 streaming Call (async get_next via repeated awaits). A registered
  *     stream handler produces batches lazily; Go pulls one per await. --- */
-/* Open a stream op: delivers a cursor id (u64) on `token`, or 0 if `op` has no
- * stream handler. */
-void sable_stream_open(const SableRuntime *rt, uint32_t op, const uint8_t *req, size_t req_len, uint64_t token);
+/* Open a stream op. Admission-controlled: returns 1 if admitted (a cursor id, or
+ * 0 for an unknown op, will be delivered on `token`) or 0 if refused at the
+ * in-flight cap (NO completion — caller must not park). The admission slot is held
+ * for the cursor's LIFETIME, so sable_set_max_in_flight caps concurrent live
+ * streams; sable_stream_close releases it. */
+int sable_stream_open(const SableRuntime *rt, uint32_t op, const uint8_t *req, size_t req_len, uint64_t token);
 /* Pull the next batch on `cursor`: delivers a batch handle (opaque, e.g. a
  * *mut FFI_ArrowArray) on `token`, or 0 at end-of-stream. On a non-zero result
  * Go takes ownership via sable_call_handle_taken(token), exactly as for the S-2
  * one-shot handle path. Each Next is a fresh completion (the goroutine parks). */
 void sable_stream_next(const SableRuntime *rt, uint64_t cursor, uint64_t token);
-/* Close the cursor: aborts the producer (dropping the pinned stream) and releases
- * any buffered batches. Safe before end-of-stream (cancel). Must not race an
- * outstanding sable_stream_next on the same cursor. */
+/* Cancellable batch pull: sable_call_cancel(token) aborts a Next parked on a slow
+ * batch, delivering the end sentinel (0). This is the race-safe way to cancel a
+ * parked Next from another thread. */
+void sable_stream_next_ctx(const SableRuntime *rt, uint64_t cursor, uint64_t token);
+/* Close the cursor: aborts the producer (dropping the pinned stream), releases
+ * buffered batches, and frees the admission slot. Safe before end-of-stream. To
+ * cancel a currently-parked Next, use sable_stream_next_ctx + sable_call_cancel
+ * rather than racing Close against it. */
 void sable_stream_close(uint64_t cursor);
 
 /* R4 cancellation: cancellable Call; sable_call_cancel aborts the in-flight

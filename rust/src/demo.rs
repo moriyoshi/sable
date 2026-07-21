@@ -21,10 +21,7 @@ pub(crate) const OP_HANDLE_DEMO: u32 = 30;
 pub(crate) fn demo_handle(_req: Vec<u8>) -> Payload {
     let val: u64 = 0x00C0FFEE;
     let ptr = Box::into_raw(Box::new(val)) as u64;
-    Payload::Handle {
-        ptr,
-        release: demo_handle_release,
-    }
+    Payload::handle(ptr, demo_handle_release)
 }
 
 /// The release callback sable's net drives if Go never takes the handle.
@@ -55,16 +52,23 @@ pub(crate) async fn demo_stream(req: Vec<u8>, tx: crate::BatchSender) {
         tokio::time::sleep(Duration::from_millis(1)).await; // async batch production
         let val = 0xB000_u64 + i as u64;
         let ptr = Box::into_raw(Box::new(val)) as u64;
-        let batch = Payload::Handle {
-            ptr,
-            release: demo_handle_release,
-        };
+        let batch = Payload::handle(ptr, demo_handle_release);
         if tx.send(batch).await.is_err() {
             // Receiver gone (cursor closed): release this batch and stop.
             unsafe { demo_handle_release(ptr) };
             break;
         }
     }
+}
+
+/// Op id for a demo stream that never produces a batch — a `Next` on it parks
+/// until the cursor is cancelled/closed. Used to test stream cancellation and
+/// backpressure deterministically.
+pub(crate) const OP_STREAM_STALL: u32 = 41;
+
+/// A demo stream that stalls: it emits nothing and sleeps, so any `Next` parks.
+pub(crate) async fn demo_stream_stall(_req: Vec<u8>, _tx: crate::BatchSender) {
+    tokio::time::sleep(Duration::from_secs(3600)).await;
 }
 
 /// Dispatch a Call op to its demo handler. The op ids match the Go-side

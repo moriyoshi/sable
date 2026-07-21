@@ -473,6 +473,63 @@ misuse-release (Rust); `CallHandle` end-to-end zero-copy read+release, stream
 full-drain / early-close-cancel / unknown-op (Go, `-race`) — green under both the
 fast and portable backends.
 
+## Post-implementation gap review of the embedding surface (A–F)
+
+With S-1..S-5 shipped, re-read the imbh-go prescription against the *actual*
+implementation and asked what new gaps surfaced. The read/happy paths were solid;
+every gap was on the **control/robustness axis**. First a foundational check the
+prototype had never actually run: does a *combined* crate (a second crate
+depending on `sable` as an `rlib`) export sable's `#[no_mangle]` C symbols into
+its staticlib, and is the global handler registry shared across that crate
+boundary? Built a throwaway `combined` crate + a Go program under
+`-tags sable_extern_lib`: `sable_*` symbols survive, and a handler registered by
+the combined crate is reached by `sable_call` from Go. **S-5 verified end-to-end**,
+not just "symbols present."
+
+Six gaps found and closed in `de8ac41`:
+
+- **A — no cancellation on the handle/stream paths.** The byte path had
+  `sable_call_ctx`; the handle path had none, and streams had only `Close`
+  ("must not race an in-flight `sable_stream_next`"). Added `sable_call_handle_ctx`
+  / `CallHandleCtx` and `sable_stream_next_ctx` / `Stream.NextCtx`, both reusing
+  the `CancelGuard` discipline (the stream one publishes the end sentinel instead
+  of a Call completion). A `Next` parked on a slow batch can now be cancelled from
+  another goroutine — the DataFusion mid-scan cancel the prescription's S-3 wanted.
+- **B — the multi-thread executor was unreachable from Go.**
+  `sable_runtime_new_multithread` existed but `sableInit` hardcoded the
+  single-thread ctor. Added a build-tagged `newRuntime()` seam
+  (`-tags sable_multithread`, `SABLE_EXECUTOR_THREADS`). `make test-multithread`
+  now also runs an end-to-end Go test asserting the fused program keeps **one
+  epoll** on the multi-thread executor.
+- **C — streams bypassed backpressure.** `sable_stream_open`/`_next` used
+  `note_spawn`, so `SetMaxInFlight` had zero effect. Made `sable_stream_open`
+  admission-controlled (`try_admit`) and, crucially, **hold the in-flight slot for
+  the cursor's lifetime** (released in `close`/`drain`), so the cap bounds
+  concurrent *live* streams; `OpenStream` returns `ErrBackpressure`. Batch `next`s
+  publish without touching the gauge (continuations of an admitted cursor).
+- **D — handle-path errors were lossy.** The prototype delivered `0` and expected
+  the caller to re-run via the byte `Call` — unsafe for non-idempotent queries.
+  Added `sable_call_handle_error(token)`: the handler's error is boxed as a
+  `CallResult` keyed by token and read once, no re-execution.
+- **E — an exported-but-unsent batch could leak.** `Payload::Handle` had no `Drop`,
+  so a batch a producer exported then dropped (aborted mid-stream, buffered at
+  close, misrouted to the byte path) leaked its pointer. Reshaped `Payload::Handle`
+  around a **self-releasing `Handle`** (frees on drop unless disarmed via
+  `into_raw`). Delivery disarms and transfers to Go; every other drop frees once.
+  Collapsed the drain loops to plain channel drains. (Aliased `tokio::runtime::Handle`
+  → `TokioHandle` to free the name.)
+- **F — registration had no C/Go entry or ordering guard.** Kept registration
+  Rust-only (driven from the combined crate before `Init`) but documented the
+  contract and confirmed an unregistered op returns a clean `"unknown op N"` error
+  on every path — not UB. The combined-crate e2e above exercises exactly this.
+
+Tests added: handle ctx-cancel, stream next-cancel (against a *stalling* demo
+stream so the pull genuinely parks), stream backpressure, unknown-op error
+fidelity (Go, `-race`); multi-thread single-epoll e2e. README **Embedding**,
+**Limitations**, and **Ownership & lifetimes** sections updated to match. Full
+Go `-race`, Rust, portable, and multithread suites green; the combined-crate S-5
+e2e re-verified against the changed `Payload` API.
+
 ---
 
 ## Standing project facts
@@ -486,11 +543,20 @@ fast and portable backends.
 - Building the core Rust lib (`--no-default-features`) to the **default** target
   dir clobbers the fast `libsable.a`; portable/http/rust2go builds each use a
   separate `--target-dir`.
-- `go vet ./...` reports three `possible misuse of unsafe.Pointer` notes in
-  `park.go`/`trampoline.go` — intentional `unsafe.Pointer(uintptr)` on the
-  gopark/asmcgocall glue, guarded by `//go:nocheckptr`; `go test`'s vet subset
-  does not flag them.
+- `go vet ./...` reports `possible misuse of unsafe.Pointer` notes in
+  `park.go`/`trampoline.go` and the handle/stream tests (`handle_test.go`,
+  `stream_test.go`) — intentional `unsafe.Pointer(uintptr)` on the gopark/asmcgocall
+  glue and on deref of stable Rust-owned handle pointers; `go test`'s vet subset
+  does not fail on them (the suites pass under `-race`).
+- **The `main` branch ruleset requires verified signatures.** Commit signing is
+  configured (`gpg.format=ssh`, `user.signingkey=~/.ssh/id_ed25519`) but
+  `commit.gpgsign` is **off**, so commit with `-S` (or the push is rejected with
+  `GH013`). The key is passphrase-protected; sign from an interactive shell (or with
+  it loaded in `ssh-agent`). The remote is SSH; `gh` is authed with `repo` scope, so
+  an HTTPS push via `git -c credential.helper='!gh auth git-credential' push
+  https://github.com/moriyoshi/sable.git main` also works once the commit is signed.
 - **Open follow-ups (not blocking):** macOS certification on real hardware;
   Windows IOCP doorbell handle; non-Linux `/proc` guards for the fast-only
   stress/robust suites; inline under `Handle::enter()` (M8) + pooled waker
-  registry (M9); a user-populated dispatch registry replacing the demo ops.
+  registry (M9); a typed codegen layer over the byte Call transport; the reverse
+  direction (Rust awaiting a Go handler).

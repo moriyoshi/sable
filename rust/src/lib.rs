@@ -33,8 +33,8 @@ mod demo;
 // the crate root so a dependent crate does `sable::register(op, handler)`.
 mod registry;
 pub use registry::{
-    register, register_stream, AsyncHandler, BatchSender, HandlerFuture, HandlerResult, Payload,
-    StreamFuture, StreamHandler,
+    register, register_stream, AsyncHandler, BatchSender, Handle, HandlerFuture, HandlerResult,
+    Payload, StreamFuture, StreamHandler,
 };
 
 // Real rust2go (g2r) integration: a typed Go->Rust asm crossing that kicks off
@@ -71,7 +71,9 @@ use std::time::Duration;
 
 #[cfg(feature = "fast")]
 use reactor::GoAsyncFd;
-use tokio::runtime::Handle;
+// Aliased: `Handle` (the crate's public opaque-handle type, re-exported from
+// registry) would otherwise collide with tokio's runtime handle.
+use tokio::runtime::Handle as TokioHandle;
 
 /// A `(token, result)` pair queued for the Go dispatcher to deliver.
 type Completion = (u64, u64);
@@ -194,7 +196,7 @@ impl Drop for Inner {
 
 /// Opaque runtime handle handed to Go.
 pub struct SableRuntime {
-    handle: Handle,
+    handle: TokioHandle,
     inner: Arc<Inner>,
     // Shutdown plumbing (exercised in M5; unused in normal M2 runs).
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
@@ -456,6 +458,7 @@ impl SableRuntime {
         // open cursors, releasing their buffered batches (S-3).
         drain_cursors();
         drain_armed_handles();
+        drain_handle_errors();
     }
 }
 
@@ -717,6 +720,16 @@ async fn fallback_dispatch(op: u32, _req: Vec<u8>) -> HandlerResult {
     Err(format!("unknown op {op}").into_bytes())
 }
 
+/// Copy a request buffer from Go's memory into a Rust-owned `Vec` (the caller
+/// keeps its buffer alive only for the duration of the FFI call via KeepAlive).
+fn copy_req(req_ptr: *const u8, req_len: usize) -> Vec<u8> {
+    if req_len == 0 {
+        Vec::new()
+    } else {
+        unsafe { std::slice::from_raw_parts(req_ptr, req_len) }.to_vec()
+    }
+}
+
 /// Turn a dispatch result into a boxed `CallResult` handle for the BYTE path. A
 /// handler that returned `Payload::Handle` on the byte path is a misuse: release
 /// the handle (so it doesn't leak) and report an error rather than smuggling a
@@ -724,8 +737,8 @@ async fn fallback_dispatch(op: u32, _req: Vec<u8>) -> HandlerResult {
 fn byte_result_handle(r: HandlerResult) -> u64 {
     let (ok, bytes) = match r {
         Ok(Payload::Bytes(b)) => (true, b),
-        Ok(Payload::Handle { ptr, release }) => {
-            unsafe { release(ptr) };
+        Ok(Payload::Handle(_h)) => {
+            // Misuse: a handle on the byte path. `_h` drops here, releasing it.
             (false, b"sable: handler returned a handle on the byte Call path".to_vec())
         }
         Err(e) => (false, e),
@@ -837,9 +850,11 @@ pub extern "C" fn sable_call_free(handle: u64) {
 //     exactly once for every still-armed entry — the same publish-on-drop
 //     discipline as the CancelGuard.
 //
-// Error/cancel encoding: a `u64` result of 0 = "no handle" (handler errored, or
-// returned bytes on this path). Nothing is armed for such a token, so Go must
-// not call `sable_call_handle_taken` on a 0 result.
+// Result encoding on the handle wire: a `u64` of 0 = "no handle" — the handler
+// errored, returned bytes, or the call was cancelled. On a 0 result the caller
+// must NOT call `sable_call_handle_taken`; it distinguishes the cases via
+// `sable_call_handle_error` (D: error bytes recorded per token, no re-run) and,
+// for the ctx variant, its own ctx.Err() (cancellation).
 // ---------------------------------------------------------------------------
 
 /// An opaque handle armed for release-on-drop. `ptr` is opaque and `release` is
@@ -851,6 +866,12 @@ struct ArmedHandle {
 unsafe impl Send for ArmedHandle {}
 
 static HANDLES: LazyLock<Mutex<HashMap<u64, ArmedHandle>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Errors produced on the handle path, keyed by token (D): a boxed `CallResult`
+/// (`ok=false`) the caller reads via `sable_call_handle_error` — so a handler
+/// error arrives WITHOUT re-running the op (unsafe for non-idempotent queries).
+static HANDLE_ERRORS: LazyLock<Mutex<HashMap<u64, u64>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Release every still-armed handle exactly once (shutdown safety net). Called
@@ -866,10 +887,49 @@ fn drain_armed_handles() {
     }
 }
 
-/// Await a Call op on the zero-copy handle path. On success (handler returned
-/// `Payload::Handle`) arms the release net and delivers `ptr`; otherwise delivers
-/// 0 (no handle) — the error bytes, if any, are dropped on this path (the caller
-/// re-runs via the byte `sable_call` to read them; see the header note).
+/// Free any handle-path error boxes the caller never read (shutdown safety).
+fn drain_handle_errors() {
+    let boxes: Vec<u64> = { HANDLE_ERRORS.lock().unwrap().drain().map(|(_, h)| h).collect() };
+    for h in boxes {
+        if h != 0 {
+            unsafe { drop(Box::from_raw(h as *mut CallResult)) };
+        }
+    }
+}
+
+/// Record error bytes for `token` on the handle path as a boxed `CallResult`.
+fn record_handle_error(token: u64, bytes: Vec<u8>) {
+    let h = Box::into_raw(Box::new(CallResult { ok: false, bytes })) as u64;
+    HANDLE_ERRORS.lock().unwrap().insert(token, h);
+}
+
+/// Deliver a dispatch result on the handle path (shared by the plain and ctx
+/// entry points): arm + deliver a real handle, or record an error box and deliver
+/// 0. A null-ptr handle and an end/bytes result deliver 0 with no error.
+fn deliver_handle_result(inner: &Inner, token: u64, r: HandlerResult) {
+    match r {
+        Ok(Payload::Handle(h)) if h.ptr() != 0 => {
+            // Arm the net BEFORE completing so a shutdown racing delivery still
+            // frees it; `handle_taken` disarms on the normal path.
+            let (ptr, release) = h.into_raw();
+            HANDLES.lock().unwrap().insert(token, ArmedHandle { ptr, release });
+            inner.complete(token, ptr);
+        }
+        Ok(Payload::Handle(_h)) => inner.complete(token, 0), // null ptr: _h drops
+        Ok(Payload::Bytes(_)) => {
+            record_handle_error(token, b"sable: handler returned bytes on the handle path".to_vec());
+            inner.complete(token, 0);
+        }
+        Err(e) => {
+            record_handle_error(token, e);
+            inner.complete(token, 0);
+        }
+    }
+}
+
+/// Await a Call op on the zero-copy handle path. On success arms the release net
+/// and delivers `ptr`; on error records the error (see `sable_call_handle_error`)
+/// and delivers 0. Not cancellable — use `sable_call_handle_ctx` for that.
 #[unsafe(no_mangle)]
 pub extern "C" fn sable_call_handle(
     rt: *const SableRuntime,
@@ -879,29 +939,50 @@ pub extern "C" fn sable_call_handle(
     token: u64,
 ) {
     let rt = unsafe { &*rt };
-    let req = if req_len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(req_ptr, req_len) }.to_vec()
-    };
+    let req = copy_req(req_ptr, req_len);
     let inner = rt.inner.clone();
     inner.note_spawn();
     rt.handle.spawn(async move {
-        match dispatch(op, req).await {
-            Ok(Payload::Handle { ptr, release }) if ptr != 0 => {
-                // Arm the net BEFORE completing so a shutdown racing delivery
-                // still frees it; `handle_taken` disarms on the normal path.
-                HANDLES.lock().unwrap().insert(token, ArmedHandle { ptr, release });
-                inner.complete(token, ptr);
-            }
-            Ok(Payload::Handle { ptr, release }) => {
-                // Null ptr: release immediately and report "no handle".
-                unsafe { release(ptr) };
-                inner.complete(token, 0);
-            }
-            Ok(Payload::Bytes(_)) | Err(_) => inner.complete(token, 0),
-        }
+        let r = dispatch(op, req).await;
+        deliver_handle_result(&inner, token, r);
     });
+}
+
+/// Cancellable handle path (A): like `sable_call_handle`, but registers an
+/// AbortHandle so `sable_call_cancel(token)` aborts the in-flight op (its future
+/// dropped, its `Drop` run), delivering 0 (the caller reports ctx.Err()).
+#[unsafe(no_mangle)]
+pub extern "C" fn sable_call_handle_ctx(
+    rt: *const SableRuntime,
+    op: u32,
+    req_ptr: *const u8,
+    req_len: usize,
+    token: u64,
+) {
+    let rt = unsafe { &*rt };
+    let req = copy_req(req_ptr, req_len);
+    let inner = rt.inner.clone();
+    let cell: CancelCell = Arc::new(Mutex::new(None));
+    CANCELS.lock().unwrap().insert(token, cell.clone());
+    inner.note_spawn();
+    let guard = CancelGuard { inner: inner.clone(), token, armed: true };
+    let jh = rt.handle.spawn(async move {
+        let mut guard = guard;
+        let r = dispatch(op, req).await;
+        guard.armed = false; // completed normally
+        deliver_handle_result(&inner, token, r);
+        // guard drops here (disarmed): removes from CANCELS, no cancel publish.
+    });
+    *cell.lock().unwrap() = Some(jh.abort_handle());
+}
+
+/// Retrieve the error recorded for a 0-result handle call (D). Returns a
+/// `CallResult` handle (read via `sable_call_result` + `sable_call_free`, exactly
+/// like the byte path) or 0 if there was none (cancellation, or a genuine "no
+/// handle"). Removes the entry — call at most once per token.
+#[unsafe(no_mangle)]
+pub extern "C" fn sable_call_handle_error(token: u64) -> u64 {
+    HANDLE_ERRORS.lock().unwrap().remove(&token).unwrap_or(0)
 }
 
 /// Tell sable Go has taken ownership of the handle delivered on `token`: drop the
@@ -936,14 +1017,34 @@ pub extern "C" fn sable_call_handle_taken(token: u64) {
 const STREAM_BUF: usize = 4;
 
 /// A live server-side cursor: the receiving end of the producer's batch channel,
-/// plus a handle to abort the producer on close.
+/// a handle to abort the producer, and the runtime `Inner` so `close`/teardown can
+/// release the admission slot held for the cursor's lifetime (C).
 struct Cursor {
     rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<Payload>>>,
     producer: tokio::task::AbortHandle,
+    inner: Arc<Inner>,
 }
 
 static CURSORS: LazyLock<Mutex<HashMap<u64, Cursor>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 static CURSOR_CTR: AtomicU64 = AtomicU64::new(1);
+
+/// Per-`Next` cancel guard (A). Unlike `CancelGuard`, the stream path does not use
+/// the Call admission gauge (the cursor holds the slot), so on abort it delivers
+/// the end sentinel via `publish` rather than `complete`.
+struct StreamCancelGuard {
+    inner: Arc<Inner>,
+    token: u64,
+    armed: bool,
+}
+impl Drop for StreamCancelGuard {
+    fn drop(&mut self) {
+        CANCELS.lock().unwrap().remove(&self.token);
+        if self.armed {
+            self.inner.note_cancel();
+            self.inner.publish(self.token, 0); // cancelled => end-of-stream sentinel
+        }
+    }
+}
 
 /// Resolve a stream op to its handler: registry first, then the demo stream op.
 fn stream_handler(op: u32) -> Option<Arc<dyn StreamHandler>> {
@@ -954,21 +1055,35 @@ fn stream_handler(op: u32) -> Option<Arc<dyn StreamHandler>> {
     if op == demo::OP_STREAM_DEMO {
         return Some(Arc::new(demo::demo_stream) as Arc<dyn StreamHandler>);
     }
+    #[cfg(feature = "demo")]
+    if op == demo::OP_STREAM_STALL {
+        return Some(Arc::new(demo::demo_stream_stall) as Arc<dyn StreamHandler>);
+    }
     None
 }
 
-/// Drain a cursor's buffered batches, releasing any handles (avoids leaking a
-/// produced-but-unpulled batch when a cursor is closed/torn down). Best-effort:
-/// if a `sable_stream_next` currently holds the lock, its own task owns the batch
-/// it pulled. Callers abort the producer first so no new batch is buffered.
+/// Deliver one pulled batch on `token`: arm + publish a real handle, else publish
+/// 0 (null handle / bytes / end-of-stream). A dropped `Payload` releases its
+/// handle (E), so the non-handle arms leak nothing. Uses `publish`, not
+/// `complete`: batch pulls don't touch the Call admission gauge (the cursor does).
+fn deliver_batch(inner: &Inner, token: u64, batch: Option<Payload>) {
+    match batch {
+        Some(Payload::Handle(h)) if h.ptr() != 0 => {
+            let (ptr, release) = h.into_raw();
+            HANDLES.lock().unwrap().insert(token, ArmedHandle { ptr, release });
+            inner.publish(token, ptr);
+        }
+        _ => inner.publish(token, 0),
+    }
+}
+
+/// Tear a cursor down: abort the producer (dropping the pinned DataFusion stream)
+/// and drain buffered batches — each dropped `Payload` releases its handle (E).
+/// Best-effort on the lock: an in-flight `Next` owns the batch it pulled.
 fn drain_cursor(c: &Cursor) {
     c.producer.abort();
     if let Ok(mut rx) = c.rx.try_lock() {
-        while let Ok(p) = rx.try_recv() {
-            if let Payload::Handle { ptr, release } = p {
-                unsafe { release(ptr) };
-            }
-        }
+        while rx.try_recv().is_ok() {} // dropping each Payload releases its handle
     }
 }
 
@@ -981,11 +1096,40 @@ fn drain_cursors() {
     };
     for c in cursors {
         drain_cursor(&c);
+        c.inner.note_complete(); // release the admission slot held since open (C)
     }
 }
 
-/// Open a streaming op: spawn the handler as a producer, register the cursor, and
-/// deliver the cursor id on `token` (0 if the op has no stream handler).
+/// Register a producer + cursor for an admitted open, deep inside the open task.
+/// Returns the cursor id, or releases the slot and returns 0 for an unknown op.
+async fn open_cursor(inner: &Arc<Inner>, op: u32, req: Vec<u8>) -> u64 {
+    let handler = match stream_handler(op) {
+        Some(h) => h,
+        None => {
+            inner.note_complete(); // release the slot; no cursor created
+            return 0;
+        }
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel::<Payload>(STREAM_BUF);
+    // Producer runs on this runtime; dropping tx (return) ends the stream.
+    let producer = tokio::spawn(async move { handler.run(req, tx).await });
+    let cursor_id = CURSOR_CTR.fetch_add(1, Ordering::Relaxed);
+    CURSORS.lock().unwrap().insert(
+        cursor_id,
+        Cursor {
+            rx: Arc::new(tokio::sync::Mutex::new(rx)),
+            producer: producer.abort_handle(),
+            inner: inner.clone(),
+        },
+    );
+    cursor_id
+}
+
+/// Open a streaming op. Admission-controlled (C): returns 1 if admitted (a cursor
+/// id — or 0 for an unknown op — will be delivered on `token`) or 0 if refused at
+/// the in-flight cap (NO completion; caller must not park). The admission slot is
+/// held for the cursor's LIFETIME, so `SetMaxInFlight` caps concurrent live
+/// streams; `sable_stream_close` releases it.
 #[unsafe(no_mangle)]
 pub extern "C" fn sable_stream_open(
     rt: *const SableRuntime,
@@ -993,82 +1137,88 @@ pub extern "C" fn sable_stream_open(
     req_ptr: *const u8,
     req_len: usize,
     token: u64,
-) {
+) -> c_int {
     let rt = unsafe { &*rt };
-    let req = if req_len == 0 {
-        Vec::new()
-    } else {
-        unsafe { std::slice::from_raw_parts(req_ptr, req_len) }.to_vec()
-    };
+    if !rt.inner.try_admit() {
+        return 0; // refused at cap: no cursor, caller must not park on `token`
+    }
+    let req = copy_req(req_ptr, req_len);
     let inner = rt.inner.clone();
-    inner.note_spawn();
-    let handler = stream_handler(op);
     rt.handle.spawn(async move {
-        let handler = match handler {
-            Some(h) => h,
-            None => {
-                inner.complete(token, 0); // unknown stream op: no cursor
-                return;
-            }
-        };
-        let (tx, rx) = tokio::sync::mpsc::channel::<Payload>(STREAM_BUF);
-        // Producer runs on this runtime; dropping tx (return) ends the stream.
-        let producer = tokio::spawn(async move { handler.run(req, tx).await });
-        let cursor_id = CURSOR_CTR.fetch_add(1, Ordering::Relaxed);
-        CURSORS.lock().unwrap().insert(
-            cursor_id,
-            Cursor {
-                rx: Arc::new(tokio::sync::Mutex::new(rx)),
-                producer: producer.abort_handle(),
-            },
-        );
-        inner.complete(token, cursor_id);
+        let cursor_id = open_cursor(&inner, op, req).await;
+        // Deliver WITHOUT note_complete: the slot is held until close (C).
+        inner.publish(token, cursor_id);
     });
+    1
 }
 
-/// Pull the next batch on `cursor`: awaits one batch and completes `token` with
-/// its handle (Go takes it via sable_call_handle_taken), or 0 at end-of-stream /
-/// unknown cursor. A fresh completion per call — the goroutine parks, no M blocks.
+/// Pull the next batch on `cursor` (non-cancellable): delivers its handle on
+/// `token`, or 0 at end-of-stream / unknown cursor. A fresh completion per call —
+/// the goroutine parks, no M blocks, no `block_on`.
 #[unsafe(no_mangle)]
 pub extern "C" fn sable_stream_next(rt: *const SableRuntime, cursor: u64, token: u64) {
     let rt = unsafe { &*rt };
     let inner = rt.inner.clone();
     let rx = CURSORS.lock().unwrap().get(&cursor).map(|c| c.rx.clone());
-    inner.note_spawn();
     let rx = match rx {
         Some(r) => r,
         None => {
-            inner.complete(token, 0); // unknown/closed cursor => end
+            inner.publish(token, 0); // unknown/closed cursor => end
             return;
         }
     };
     rt.handle.spawn(async move {
-        let mut guard = rx.lock().await;
-        match guard.recv().await {
-            Some(Payload::Handle { ptr, release }) if ptr != 0 => {
-                HANDLES.lock().unwrap().insert(token, ArmedHandle { ptr, release });
-                inner.complete(token, ptr);
-            }
-            Some(Payload::Handle { ptr, release }) => {
-                unsafe { release(ptr) };
-                inner.complete(token, 0);
-            }
-            // The stream path carries handles; bytes are unsupported here.
-            Some(Payload::Bytes(_)) => inner.complete(token, 0),
-            None => inner.complete(token, 0), // producer done => end of stream
-        }
+        let batch = {
+            let mut guard = rx.lock().await;
+            guard.recv().await
+        };
+        deliver_batch(&inner, token, batch);
     });
 }
 
-/// Close a cursor: abort the producer (dropping the pinned DataFusion stream) and
-/// release any buffered batches. Safe to call before end-of-stream (cancel). Must
-/// not race an outstanding sable_stream_next on the same cursor (Go iterates one
-/// batch at a time).
+/// Cancellable batch pull (A): like `sable_stream_next`, but registers an
+/// AbortHandle so `sable_call_cancel(token)` aborts a `Next` parked on a slow
+/// batch — dropping the recv future (releasing the rx lock) and delivering the end
+/// sentinel. This is the race-safe mid-stream cancel (a parked `Next` can be
+/// cancelled from another goroutine); `Close` remains for teardown.
+#[unsafe(no_mangle)]
+pub extern "C" fn sable_stream_next_ctx(rt: *const SableRuntime, cursor: u64, token: u64) {
+    let rt = unsafe { &*rt };
+    let inner = rt.inner.clone();
+    let rx = CURSORS.lock().unwrap().get(&cursor).map(|c| c.rx.clone());
+    let rx = match rx {
+        Some(r) => r,
+        None => {
+            inner.publish(token, 0);
+            return;
+        }
+    };
+    let cell: CancelCell = Arc::new(Mutex::new(None));
+    CANCELS.lock().unwrap().insert(token, cell.clone());
+    let guard = StreamCancelGuard { inner: inner.clone(), token, armed: true };
+    let jh = rt.handle.spawn(async move {
+        let mut guard = guard;
+        let batch = {
+            let mut g = rx.lock().await;
+            g.recv().await
+        };
+        guard.armed = false; // received (or ended) normally, not cancelled
+        deliver_batch(&inner, token, batch);
+    });
+    *cell.lock().unwrap() = Some(jh.abort_handle());
+}
+
+/// Close a cursor: abort the producer (dropping the pinned DataFusion stream),
+/// release buffered batches, and free the admission slot held since open (C). Safe
+/// before end-of-stream (cancel of a whole stream). To cancel a `Next` that is
+/// currently parked, use `sable_stream_next_ctx` + `sable_call_cancel` instead of
+/// racing `Close` against it.
 #[unsafe(no_mangle)]
 pub extern "C" fn sable_stream_close(cursor: u64) {
     let c = CURSORS.lock().unwrap().remove(&cursor);
     if let Some(c) = c {
         drain_cursor(&c);
+        c.inner.note_complete(); // release the admission slot (C)
     }
 }
 
@@ -1261,14 +1411,12 @@ mod registry_tests {
             drop(unsafe { Box::from_raw(p as *mut u64) });
         }
         register(9_002, |_req| async move {
-            Ok(Payload::Handle {
-                ptr: Box::into_raw(Box::new(7u64)) as u64,
-                release: rel,
-            })
+            Ok(Payload::handle(Box::into_raw(Box::new(7u64)) as u64, rel))
         });
         match dispatch(9_002, Vec::new()).await {
-            Ok(Payload::Handle { ptr, release }) => {
-                assert_eq!(unsafe { *(ptr as *const u64) }, 7);
+            Ok(Payload::Handle(h)) => {
+                assert_eq!(unsafe { *(h.ptr() as *const u64) }, 7);
+                let (ptr, release) = h.into_raw();
                 unsafe { release(ptr) }; // no leak (Miri/valgrind)
             }
             _ => panic!("expected handle"),
@@ -1304,10 +1452,7 @@ mod registry_tests {
         unsafe extern "C" fn rel(p: u64) {
             drop(unsafe { Box::from_raw(p as *mut u64) });
         }
-        let h = byte_result_handle(Ok(Payload::Handle {
-            ptr: Box::into_raw(Box::new(1u64)) as u64,
-            release: rel,
-        }));
+        let h = byte_result_handle(Ok(Payload::handle(Box::into_raw(Box::new(1u64)) as u64, rel)));
         let r = unsafe { &*(h as *const CallResult) };
         assert!(!r.ok);
         sable_call_free(h);

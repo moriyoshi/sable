@@ -174,12 +174,18 @@ bench-pure:
 	cargo build --release --manifest-path $(RUST_DIR)/Cargo.toml --features http --bin pure_bench --target-dir $(HTTP_TARGET_DIR)
 	$(HTTP_TARGET_DIR)/release/pure_bench
 
-# S-4.2: empirically validate that an IO-disabled multi-thread executor creates
-# NO epoll (with an enable_all+socket control proving the epoll is IO-sourced).
-# Green here => sable can offer real parallelism for CPU-heavy handlers while
-# preserving the single-epoll invariant.
+# S-4.2: (1) empirically validate that an IO-disabled multi-thread executor
+# creates NO epoll (Rust s4_epoll tests, with an enable_all+socket control), then
+# (2) end-to-end — build the runtime on that executor (-tags sable_multithread)
+# and assert the fused Go program still holds exactly one epoll while the
+# handle/stream paths work. Green => real parallelism for CPU-heavy handlers with
+# the single-epoll invariant preserved.
+MT_TARGET_DIR := $(RUST_DIR)/target-multithread
+MT_CGO_LDFLAGS := -L$(CURDIR)/$(MT_TARGET_DIR)/release
 test-multithread:
 	cargo test --release --manifest-path $(RUST_DIR)/Cargo.toml --features multithread s4_epoll -- --test-threads=1
+	cargo build --release --manifest-path $(RUST_DIR)/Cargo.toml --features multithread --target-dir $(MT_TARGET_DIR)
+	CGO_LDFLAGS="$(MT_CGO_LDFLAGS)" go test -tags sable_multithread -race -count=1 -run 'TestMultithread|TestCallHandle|TestStream' .
 
 clean:
 	cargo clean --manifest-path $(RUST_DIR)/Cargo.toml

@@ -52,7 +52,7 @@ func newAndFreeRuntime() {
 // call once (from main or TestMain).
 func sableInit() {
 	requireVerifiedGo() // fail closed on an uncertified internal ABI
-	rt = C.sable_runtime_new()
+	rt = newRuntime()   // single-thread by default; multi-thread with -tags sable_multithread
 	if rt == nil {
 		panic("sable_runtime_new failed")
 	}

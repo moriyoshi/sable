@@ -5,6 +5,8 @@ package sable
 // takes ownership + drives release. Works under both backends (core path).
 
 import (
+	"context"
+	"strings"
 	"testing"
 	"unsafe"
 )
@@ -30,11 +32,32 @@ func TestCallHandle(t *testing.T) {
 	demoHandleFree(ptr)
 }
 
-// TestCallHandleUnknownOp: an op with no handler (and not a demo handle op)
-// yields no handle, reported as ErrNoHandle rather than a bogus pointer.
+// TestCallHandleUnknownOp: an unknown op yields no handle, and the handler's
+// error is delivered on the handle path (D) — without re-running the op — rather
+// than a generic sentinel.
 func TestCallHandleUnknownOp(t *testing.T) {
 	Init()
-	if _, err := CallHandle(9999, nil); err != ErrNoHandle {
-		t.Fatalf("CallHandle(unknown) err = %v, want ErrNoHandle", err)
+	ptr, err := CallHandle(9999, nil)
+	if ptr != 0 {
+		t.Fatalf("CallHandle(unknown) ptr = %#x, want 0", ptr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "unknown op") {
+		t.Fatalf("CallHandle(unknown) err = %v, want an 'unknown op' error", err)
+	}
+}
+
+// TestCallHandleCtxCancel: cancelling the ctx before the handle lands returns
+// ctx.Err(), not a handle.
+func TestCallHandleCtxCancel(t *testing.T) {
+	Init()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // already cancelled
+	ptr, err := CallHandleCtx(ctx, OpSleepLong, nil)
+	if ptr != 0 {
+		demoHandleFree(ptr)
+		t.Fatalf("CallHandleCtx(cancelled) ptr = %#x, want 0", ptr)
+	}
+	if err != context.Canceled {
+		t.Fatalf("CallHandleCtx(cancelled) err = %v, want context.Canceled", err)
 	}
 }

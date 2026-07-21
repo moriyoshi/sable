@@ -157,8 +157,55 @@ func CallHandle(op uint32, req []byte) (uintptr, error) {
 	})
 	runtime.KeepAlive(req)
 	if ptr == 0 {
-		return 0, ErrNoHandle // nothing armed for this token; do not take
+		return 0, handleError(tok) // handler error (read without re-running) or ErrNoHandle
 	}
 	C.sable_call_handle_taken(tok) // take ownership; disarm sable's release net
 	return uintptr(ptr), nil
+}
+
+// CallHandleCtx is CallHandle with cancellation: if ctx is cancelled before the
+// handler produces its handle, the in-flight tokio task is aborted and CallHandleCtx
+// returns ctx.Err(). Best-effort — if the handle lands first, it is returned.
+func CallHandleCtx(ctx context.Context, op uint32, req []byte) (uintptr, error) {
+	Init()
+	var reqPtr *C.uint8_t
+	if len(req) > 0 {
+		reqPtr = (*C.uint8_t)(unsafe.Pointer(&req[0]))
+	}
+	stop := make(chan struct{})
+	var tok C.uint64_t
+	ptr := awaitViaPark(func(token uint64) {
+		tok = C.uint64_t(token)
+		C.sable_call_handle_ctx(rt, C.uint32_t(op), reqPtr, C.size_t(len(req)), C.uint64_t(token))
+		go func() {
+			select {
+			case <-ctx.Done():
+				C.sable_call_cancel(C.uint64_t(token))
+			case <-stop:
+			}
+		}()
+	})
+	close(stop)
+	runtime.KeepAlive(req)
+	if ptr == 0 {
+		if err := ctx.Err(); err != nil {
+			return 0, err // cancelled
+		}
+		return 0, handleError(tok)
+	}
+	C.sable_call_handle_taken(tok)
+	return uintptr(ptr), nil
+}
+
+// handleError reads the error recorded on the handle path for a 0 result (D) —
+// without re-running the op — or ErrNoHandle if there was none.
+func handleError(tok C.uint64_t) error {
+	h := uint64(C.sable_call_handle_error(tok))
+	if h == 0 {
+		return ErrNoHandle
+	}
+	if _, err := callResultBytes(h); err != nil {
+		return err
+	}
+	return ErrNoHandle
 }

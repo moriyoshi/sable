@@ -10,6 +10,7 @@ package sable
 import "C"
 
 import (
+	"context"
 	"errors"
 	"runtime"
 	"unsafe"
@@ -27,17 +28,24 @@ type Stream struct {
 	closed bool
 }
 
-// OpenStream opens a streaming op, returning a cursor to pull batches from.
+// OpenStream opens a streaming op, returning a cursor to pull batches from. It is
+// admission-controlled: at the in-flight cap (see SetMaxInFlight) it returns
+// ErrBackpressure without opening a stream — the admission slot is held for the
+// stream's lifetime, so the cap bounds concurrent live streams. Always Close a
+// returned Stream to release its slot.
 func OpenStream(op uint32, req []byte) (*Stream, error) {
 	Init()
 	var reqPtr *C.uint8_t
 	if len(req) > 0 {
 		reqPtr = (*C.uint8_t)(unsafe.Pointer(&req[0]))
 	}
-	cursor := awaitViaPark(func(token uint64) {
-		C.sable_stream_open(rt, C.uint32_t(op), reqPtr, C.size_t(len(req)), C.uint64_t(token))
+	cursor, admitted := awaitViaParkTry(func(token uint64) bool {
+		return C.sable_stream_open(rt, C.uint32_t(op), reqPtr, C.size_t(len(req)), C.uint64_t(token)) != 0
 	})
 	runtime.KeepAlive(req)
+	if !admitted {
+		return nil, ErrBackpressure
+	}
 	if cursor == 0 {
 		return nil, ErrNoStream
 	}
@@ -61,6 +69,36 @@ func (s *Stream) Next() (ptr uintptr, ok bool) {
 		return 0, false // end of stream
 	}
 	C.sable_call_handle_taken(tok) // take ownership of the batch; disarm the net
+	return uintptr(p), true
+}
+
+// NextCtx is Next with cancellation: if ctx is cancelled while parked awaiting a
+// slow batch, the pull is aborted and NextCtx returns ok=false. This is the
+// race-safe way to interrupt a parked pull — a distinct goroutine cancelling ctx
+// unblocks it. ok=false means end-of-stream OR cancellation; check ctx.Err() to
+// distinguish. After a cancellation, Close the stream.
+func (s *Stream) NextCtx(ctx context.Context) (ptr uintptr, ok bool) {
+	if s.closed {
+		return 0, false
+	}
+	stop := make(chan struct{})
+	var tok C.uint64_t
+	p := awaitViaPark(func(token uint64) {
+		tok = C.uint64_t(token)
+		C.sable_stream_next_ctx(rt, C.uint64_t(s.cursor), C.uint64_t(token))
+		go func() {
+			select {
+			case <-ctx.Done():
+				C.sable_call_cancel(C.uint64_t(token))
+			case <-stop:
+			}
+		}()
+	})
+	close(stop)
+	if p == 0 {
+		return 0, false // end-of-stream or cancelled (caller checks ctx.Err())
+	}
+	C.sable_call_handle_taken(tok)
 	return uintptr(p), true
 }
 
