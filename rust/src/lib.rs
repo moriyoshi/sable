@@ -821,7 +821,15 @@ pub extern "C" fn sable_call_result(
     let r = unsafe { &*(handle as *const CallResult) };
     unsafe {
         *out_ok = if r.ok { 1 } else { 0 };
-        *out_ptr = r.bytes.as_ptr();
+        // For an empty buffer, `Vec::as_ptr` returns a dangling-but-aligned sentinel (e.g. `0x1` for
+        // `u8`). Handing that back would land a non-null, sub-page value in the caller's pointer slot;
+        // Go's GC rejects such a value on a stack scan ("invalid pointer found on stack: 0x1"). Return a
+        // null pointer when there are no bytes so the caller stores a clean 0.
+        *out_ptr = if r.bytes.is_empty() {
+            core::ptr::null()
+        } else {
+            r.bytes.as_ptr()
+        };
         *out_len = r.bytes.len();
     }
 }
@@ -1498,14 +1506,47 @@ mod call_unsafe_tests {
     }
 
     #[test]
-    fn empty_result_has_null_or_valid_ptr() {
+    fn empty_result_returns_null_ptr() {
+        // An empty `Vec<u8>` yields the dangling `Vec::as_ptr` sentinel (0x1 for u8).
+        // sable_call_result must map that to a NULL out-pointer so the Go caller never
+        // parks a sub-page value in a pointer slot ("invalid pointer found on stack").
         let handle = Box::into_raw(Box::new(CallResult { ok: true, bytes: Vec::new() })) as u64;
         let mut ok: std::os::raw::c_int = -1;
-        let mut ptr: *const u8 = std::ptr::null();
+        let mut ptr: *const u8 = 0x1 as *const u8; // pre-seed with a non-null sentinel
         let mut len: usize = 999;
         sable_call_result(handle, &mut ok, &mut ptr, &mut len);
         assert_eq!(ok, 1);
         assert_eq!(len, 0);
+        assert!(ptr.is_null(), "empty ok result must yield a NULL ptr, got {ptr:p}");
+        sable_call_free(handle);
+    }
+
+    #[test]
+    fn empty_err_result_returns_null_ptr() {
+        // Same guarantee on the error branch: an empty error buffer must also null the ptr.
+        let handle = Box::into_raw(Box::new(CallResult { ok: false, bytes: Vec::new() })) as u64;
+        let mut ok: std::os::raw::c_int = -1;
+        let mut ptr: *const u8 = 0x1 as *const u8;
+        let mut len: usize = 999;
+        sable_call_result(handle, &mut ok, &mut ptr, &mut len);
+        assert_eq!(ok, 0);
+        assert_eq!(len, 0);
+        assert!(ptr.is_null(), "empty err result must yield a NULL ptr, got {ptr:p}");
+        sable_call_free(handle);
+    }
+
+    #[test]
+    fn nonempty_result_returns_valid_ptr() {
+        // The non-empty path must still hand back the live buffer pointer unchanged.
+        let handle = Box::into_raw(Box::new(CallResult { ok: true, bytes: vec![7u8] })) as u64;
+        let mut ok: std::os::raw::c_int = -1;
+        let mut ptr: *const u8 = std::ptr::null();
+        let mut len: usize = 0;
+        sable_call_result(handle, &mut ok, &mut ptr, &mut len);
+        assert_eq!(ok, 1);
+        assert_eq!(len, 1);
+        assert!(!ptr.is_null(), "non-empty result must yield a live ptr");
+        assert_eq!(unsafe { std::slice::from_raw_parts(ptr, len) }, &[7u8]);
         sable_call_free(handle);
     }
 }
