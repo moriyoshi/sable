@@ -53,12 +53,21 @@ func AwaitCallResult(spawn func(token uint64)) ([]byte, error) {
 }
 
 // callResultBytes copies out and frees the Rust-owned CallResult for handle.
+//
+// `ptr` is held as a uintptr, not a *C.uint8_t: the Rust buffer is C-owned memory the Go GC must never
+// scan as a heap pointer. An empty result in particular can carry a sub-page sentinel (a dangling
+// Vec::as_ptr, e.g. 0x1) that the GC rejects as an "invalid pointer found on stack" if it lands in a
+// pointer-typed stack slot. A uintptr is not scanned, so any bit pattern is inert; we materialize an
+// unsafe.Pointer only transiently for the copy, and only when there are bytes to copy.
 func callResultBytes(handle uint64) ([]byte, error) {
 	var ok C.int
-	var ptr *C.uint8_t
+	var ptr uintptr
 	var n C.size_t
-	C.sable_call_result(C.uint64_t(handle), &ok, &ptr, &n)
-	out := C.GoBytes(unsafe.Pointer(ptr), C.int(n))
+	C.sable_call_result(C.uint64_t(handle), &ok, (**C.uint8_t)(unsafe.Pointer(&ptr)), &n)
+	var out []byte
+	if n > 0 && ptr != 0 {
+		out = C.GoBytes(unsafe.Pointer(ptr), C.int(n))
+	}
 	C.sable_call_free(C.uint64_t(handle))
 	if ok == 0 {
 		return nil, errors.New(string(out))

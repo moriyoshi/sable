@@ -532,6 +532,52 @@ e2e re-verified against the changed `Payload` API.
 
 ---
 
+# Part VI — Review follow-ups
+
+## Empty-result pointer on the byte Call ABI (GC sentinel hazard)
+
+Reviewing a patch to `sable_call_result`, confirmed a real latent crash on the
+**empty-result** path. An empty Rust result buffer (`Vec::new()`, e.g. `OpEcho`
+with an empty request) makes `Vec::as_ptr` return the **dangling-but-aligned
+sentinel** `NonNull::dangling()` — `0x1` for `u8`. The byte path handed that raw
+value back through the `out_ptr` FFI slot, where the Go caller (`callResultBytes`)
+stored it in a `*C.uint8_t` — a **pointer-typed** stack slot, live across the
+following `C.GoBytes`/`C.sable_call_free` calls.
+
+Go's runtime (`runtime/stack.go`, `adjustpointers`) throws
+`invalid pointer found on stack` for any live pointer slot holding
+`0 < p < minLegalPointer` (4096) when a goroutine's stack is **copied** (a
+`morestack` growth at the `GoBytes` call site), with `debug.invalidptr` on by
+default. `0x1` fits exactly. Intermittent — needs a stack copy while the sentinel
+is live — but a genuine crash, and it violates the cgo rule against parking a
+non-Go address in Go pointer-typed memory regardless.
+
+Fixed on both sides (belt-and-suspenders; either alone suffices):
+- **rust** — `sable_call_result` returns a **NULL** `out_ptr` for an empty buffer
+  (`core::ptr::null()`) instead of the dangling sentinel.
+- **go** — `callResultBytes` holds the address as a **`uintptr`**, never a
+  `*C.uint8_t`, so the GC never scans it as a heap pointer; it materializes an
+  `unsafe.Pointer` only transiently for the copy and only when `n > 0 && ptr != 0`.
+  (A cosmetic change: an empty successful result now yields a `nil` slice rather
+  than a zero-length one — harmless; callers and `string()` treat them alike.)
+
+Tests added:
+- **rust** (`call_unsafe_tests`) — `empty_result_returns_null_ptr` and
+  `empty_err_result_returns_null_ptr` pre-seed the out-pointer with the `0x1`
+  sentinel and assert `sable_call_result` nulls it on the ok **and** err branches;
+  `nonempty_result_returns_valid_ptr` guards against over-nulling the live path.
+  (Verified the assertions bite: reverting the Rust fix fails
+  `empty_result_returns_null_ptr`.) The pre-existing
+  `empty_result_has_null_or_valid_ptr` only checked `len == 0` and passed either
+  way — replaced.
+- **go** (`call_empty_test.go`) — `TestCallEmptyResult` for empty `nil`/`[]byte{}`
+  requests, plus `TestCallEmptyResultGCStress`: 32 goroutines hammer the
+  empty-result path under aggressive GC (`SetGCPercent(5)`) entering the FFI from a
+  freshly-grown stack (`deepCallEcho` recurses), a probabilistic regression guard
+  for the sentinel hazard. Rust `call_unsafe_tests` and Go `-race` suites green.
+
+---
+
 ## Standing project facts
 
 - `go.mod` pins `toolchain go1.26.4`; **any Go upgrade is an ABI re-audit**. The
