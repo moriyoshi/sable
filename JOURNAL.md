@@ -576,6 +576,67 @@ Tests added:
   freshly-grown stack (`deepCallEcho` recurses), a probabilistic regression guard
   for the sentinel hazard. Rust `call_unsafe_tests` and Go `-race` suites green.
 
+## Go-tip tripwire: `internal/runtime/atomic` lost its linkname pushes
+
+The `go-tip` CI job (the allowed-to-fail early-warning tripwire from R1) started
+failing to **link** the canary binary on Go tip:
+
+```
+link: github.com/moriyoshi/sable: invalid reference to internal/runtime/atomic.Load
+```
+
+and, once `Load` was addressed, the same wall one symbol further on:
+
+```
+link: github.com/moriyoshi/sable: invalid reference to internal/runtime/atomic.Cas
+```
+
+**Root cause — a linker *policy* change, not an ABI/behavior break.** Go tip
+deleted the `//go:linkname` **push** directives from `internal/runtime/atomic`
+(the *"Export some functions via linkname to assembly in sync/atomic"* block that
+pushed `Load`/`Loadp`/`Load64` through Go 1.26; only `storePointer` retains a push
+on tip). Under the default `-checklinkname=1`, `cmd/link`'s `checkLinkname`
+(`cmd/link/internal/loader/loader.go`) permits an external package to *pull* a
+std **assembly** symbol only if that symbol's ABI wrapper carries a push linkname
+(`osym.IsLinkname()` / `IsLinknameStd()`). With every push gone, **all** of
+sable's `park.go` await-slot atomics — `Cas`/`Xchg`/`Store64`/`Load`/`Load64` —
+become unlinkable from an out-of-tree package. The linker `log.Fatalf`s on the
+**first** bad reference, which is why the failure surfaces one symbol at a time
+and why "fix `Load`, reveal `Cas`" looked like whack-a-mole. The atomic
+primitives themselves are unchanged, so the canaries *pass* the moment they link.
+
+**Fix — relax the check on the tripwire only (`ci.yml`, commit on branch
+`fix/go-tip-atomic-load-linkname`).** The `go-tip` step now runs
+`gotip test -ldflags=-checklinkname=0 …`. Rationale: this job is
+`continue-on-error: true` and its real purpose is to certify runtime **behavior**
+via `TestCanary*`; `-checklinkname=0` lets the canaries link and actually run on
+tip. The `Makefile` already documents `-checklinkname=0` as the sanctioned escape
+hatch, and the certified `verify` job (Go 1.26.4) keeps the default
+`-checklinkname=1` as the real gate for shipped code, so no shipping regression is
+masked. Result: all four canaries — `TestCanaryAsmcgocall`,
+`TestCanaryInternalAtomics`, `TestCanaryGoparkGoready`, `TestCanaryNetpoll` —
+**PASS** on tip.
+
+**Alternatives weighed and rejected (for now):**
+- *Switch the loads to `sync/atomic`.* An earlier attempt (orphaned commit
+  `8c6e4ab`) replaced `atomicLoad`/`atomicLoad64` with `sync/atomic` since their
+  call sites all run on a normal g after `gopark` returns. Insufficient: it only
+  rescues `Load`/`Load64`; `Cas`/`Xchg`/`Store64` still break, and the `Cas` in
+  `parkCommit` runs on **g0** where it must stay `nosplit` and race-hook-free —
+  `sync/atomic`'s race instrumentation is invalid there under `-race`. So the
+  linkname dependency cannot be fully dropped by swapping in `sync/atomic`.
+- *Provide our own amd64/arm64 assembly stubs* for `Cas`/`Xchg`/`Store64` (our
+  symbols, `nosplit`, no race hooks, immune to `checklinkname` on any future Go).
+  This is the **durable** fix, deferred here because it reintroduces
+  arch-specific asm — regressing `arch.go`'s "no hand-written per-arch asm, any
+  64-bit arch just works" property — which is a heavier change than an
+  allowed-to-fail tripwire warrants right now.
+
+**Forward warning (the tripwire doing its job).** When this `internal/runtime/
+atomic` change reaches a **stable** Go, sable's *default* build (`-checklinkname=1`)
+breaks for every user, not just CI. The asm-stub fix should land before then; it
+is tracked in the open follow-ups below.
+
 ---
 
 ## Standing project facts
@@ -601,7 +662,11 @@ Tests added:
   it loaded in `ssh-agent`). The remote is SSH; `gh` is authed with `repo` scope, so
   an HTTPS push via `git -c credential.helper='!gh auth git-credential' push
   https://github.com/moriyoshi/sable.git main` also works once the commit is signed.
-- **Open follow-ups (not blocking):** macOS certification on real hardware;
+- **Open follow-ups (not blocking):** replace the `internal/runtime/atomic.*`
+  linknames in `park.go` with our own amd64/arm64 asm stubs for
+  `Cas`/`Xchg`/`Store64` (Go tip dropped their linkname pushes — see the go-tip
+  tripwire note above), **before** that change ships in a stable Go and breaks the
+  default `-checklinkname=1` build; macOS certification on real hardware;
   Windows IOCP doorbell handle; non-Linux `/proc` guards for the fast-only
   stress/robust suites; inline under `Handle::enter()` (M8) + pooled waker
   registry (M9); a typed codegen layer over the byte Call transport; the reverse
