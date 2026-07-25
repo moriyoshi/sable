@@ -639,6 +639,108 @@ is tracked in the open follow-ups below.
 
 ---
 
+## macOS: the fast path did not actually compile (eventfd outside the doorbell)
+
+- **Symptom.** A downstream embedder (imbh-go) cross-building the combined staticlib
+  for `aarch64-apple-darwin` / `x86_64-apple-darwin` in CI failed with 6 × `E0425`:
+  `cannot find function eventfd` / `EFD_NONBLOCK` / `EFD_CLOEXEC` in `libc`. No Go
+  step involved — the Rust lib itself does not build for Apple targets.
+- **Why the README was wrong.** It claimed the completion doorbell was "the one
+  genuinely OS-specific piece" and that macOS needed "no further Rust/Go changes
+  beyond certification". `doorbell.rs` *is* properly abstracted, but two other sites
+  used `libc::eventfd` unconditionally: `goexec.rs` (per-worker doorbells, via its own
+  duplicate `make_eventfd`) and `lib.rs` (the `rust_awaits_go` helpers). The
+  `SABLE_PIPE_DOORBELL=1` test mode only exercised the *completion* doorbell, so this
+  never showed up on Linux.
+- **Fix 1 — `goexec.rs` onto `Doorbell`.** `Worker.efd: RawFd` → `Worker.bell:
+  Doorbell`, `make_eventfd()` deleted, the raw 8-byte `libc::write` in `schedule()` →
+  `bell.ring()` (which already sizes the write per primitive), and
+  `sable_goexec_worker_efd` returns `bell.read_fd()`. **No Go change needed** —
+  `goexecWorker` already reads up to 8 bytes then drains the queue, exactly the
+  contract `doorbell.rs` documents. Bonus: `make test-pipe` now covers goexec too, so
+  the self-pipe mode exercises both doorbell users.
+- **Fix 2 — `rust_awaits_go` is Linux-only, deliberately.** Unlike a doorbell, its
+  eventfd is a *value channel* (Go writes a `u64` Rust reads) registered with Go's
+  netpoller under a **single** fd; `sable_go_compute(kind, arg, efd)` hands Go the same
+  fd Rust awaits. A pipe/socketpair has distinct ends, so porting means widening that C
+  ABI to two fds and reworking an fd-ownership close protocol the code itself flags as
+  fd-reuse-race-sensitive. It is demo/benchmark surface used by no embedder, so it is
+  gated to Linux. The two **entry points stay present on every target**
+  (`sable_spawn_rust_awaits_go`, `sable_future_new` kind 5) because `bridge_fast.go`
+  calls them unconditionally — gating the symbols out would break the Go link off
+  Linux. Off Linux they fall back to a plain compute and still complete their token, so
+  no goroutine hangs.
+- **Verification.** `cargo check --target {aarch64,x86_64}-apple-darwin` is clean with
+  zero warnings — and needs **no macOS SDK**, since `check` never links, so this is
+  enforceable from a Linux box and worth wiring into CI. Linux is unchanged (every new
+  `cfg` is `target_os = "linux"`): `make test`, `make test-safe`, `make test-pipe` all
+  green under `-race`, and `TestGoExec` passes 3/3 under `SABLE_PIPE_DOORBELL=1`,
+  which is the macOS primitive. Pre-existing and untouched: 32 `not_unsafe_ptr_arg_deref`
+  clippy errors (identical count at the parent commit) and `cargo fmt` drift in
+  `pure_bench.rs` / `registry.rs` / unrelated `lib.rs` sites.
+- **Still open.** Real-hardware certification (`GOOS=darwin make abi-check`); the
+  `/proc/self/{fd,status}` assertions in the fast-only stress/robust suites; and the
+  two-fd port of the value channel if an embedder ever needs it.
+
+## macOS: making `make test` actually run on Apple hardware (Go side + certification)
+
+The prior entry got the *Rust* lib to `cargo check` clean for Apple targets, but off
+a real `darwin/arm64` box `make test` still failed at four layers below Rust — three
+build/link blockers, then the runtime assertions. Fixed all four; two of that entry's
+three "Still open" items are now closed.
+
+- **Blocker 1 — `syscall.Pipe2` is Linux-only.** `bridge_fast.go` and `canary_test.go`
+  built the fused pipe with `syscall.Pipe2(fds, O_NONBLOCK|O_CLOEXEC)`, which does not
+  exist on darwin (`undefined: syscall.Pipe2`, hard build failure). Added
+  `pipe_util.go` (`!sable_portable`) with a portable `nonblockingPipe` that does
+  `syscall.Pipe` + `CloseOnExec` + `SetNonblock` under `syscall.ForkLock.RLock` (the
+  fork-race window `Pipe2`'s atomic flags close on Linux; the RLock is the standard-lib
+  idiom for the two-syscall fallback). Both call sites now go through it.
+- **Blocker 2 — the cgo link line hardcoded Linux system libs.** `link_default.go` /
+  `link_extern.go` carried `-lgcc_s -lutil -lrt -lpthread -lm -ldl` in a single
+  `#cgo LDFLAGS`; darwin has none of `gcc_s`/`rt`/`util`/`dl` (`ld: library 'gcc_s'
+  not found`). Split into `#cgo linux LDFLAGS:` (unchanged) and `#cgo darwin LDFLAGS:`.
+  `cargo rustc --release -- --print native-static-libs` reports the darwin staticlib
+  needs `-liconv -lSystem -lc -lm`; libSystem already provides libc/libm and cgo links
+  it by default, so `-liconv` is the **only** genuinely-extra flag (keeping `-lSystem`
+  drew a `duplicate libraries` warning). `-lsable`/`-L` stay in the shared directive so
+  ordering (lsable before its deps) is preserved.
+- **Blocker 3 — the ABI guard fails closed on an uncertified toolchain.** This box runs
+  **go1.26.5**; `SupportedGoVersions` listed only `go1.26.4`, so `requireVerifiedGo`
+  panicked in the constructor. Ran the documented certification (`make abi-check`): all
+  four behavioral canaries (gopark/goready, asmcgocall, netpoll, internal atomics) PASS
+  and all five linknamed symbols are present in the linked binary on `darwin/arm64` +
+  go1.26.5 — so the internal ABI is intact here, not just assumed. Added `go1.26.5` to
+  the list. (`go.mod` still pins `toolchain go1.26.4`; per the standing fact this is an
+  ABI re-audit each bump — done for .5.)
+- **Runtime failures — four Linux-only assertions, gated not ported.** Once it built,
+  four tests failed because they assert Linux-only behavior, consistent with the prior
+  entry's design decision:
+  - `TestRustAwaitsGo` / `TestSingleEpoll` (the `demoRustAwaitsGo == 7` leg) — off Linux
+    the value channel falls through to `run_demo`, so kind 0 returns **42** (the
+    Rust-side sleep result), not 7 (the *Go* compute). The Go-compute-over-netpoll path
+    is exactly what stays Linux-only.
+  - `TestInline`'s kind-5 leg — `sable_future_new` kind 5 falls through to `run_demo`,
+    which has no kind 5 (`_ => 0`), so it returns **0**, not the echoed arg. The kind-2/4
+    inline fast paths still run and are asserted on every OS.
+  - `TestSingleEpoll` / `TestSingleEpollUnderLoad` (the epoll count) — `countEpollFds`
+    reads `/proc/self/fd` for `[eventpoll]` and returns **-1** off Linux; the invariant
+    is meaningless without epoll (darwin uses kqueue).
+  Added a `skipNonLinux(t, what)` helper (in `sable_test.go`, shared across the
+  `!sable_portable` in-package tests) and gated exactly those legs. This matches the
+  *existing* graceful-degradation pattern: `TestNoResourceLeak` / `TestRuntimeTeardown`
+  already no-op their `/proc` checks via `-1` sentinels — these four just lacked the
+  guard. `readPipeViaRust` (reactor-based `go_read_pipe`, no `cfg`) and the kind-1 echo
+  stress **do** run on darwin and pass, so the fused-fd reactor path has real coverage.
+- **Verification.** On `darwin/arm64` + go1.26.5: `make test`, `test-safe`, `test-pipe`,
+  `test-portable` all green under `-race`; `make abi-check` PASS.
+- **Still open (unchanged).** The two-fd port of the `rust_awaits_go` value channel if
+  an embedder ever needs Go-compute-over-netpoll on non-Linux — the one remaining item
+  from the prior entry. macOS build + `-race` test + abi-check are now covered on real
+  hardware.
+
+---
+
 ## Standing project facts
 
 - `go.mod` pins `toolchain go1.26.4`; **any Go upgrade is an ABI re-audit**. The

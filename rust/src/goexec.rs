@@ -18,7 +18,6 @@
 
 use std::future::Future;
 use std::os::raw::c_int;
-use std::os::unix::io::RawFd;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
@@ -26,6 +25,8 @@ use std::task::{Context, Poll};
 
 use async_task::Runnable;
 use crossbeam_queue::SegQueue;
+
+use crate::doorbell::Doorbell;
 
 extern "C" {
     /// Go `//export`: deliver `result` for `token`. Called from within a
@@ -35,7 +36,12 @@ extern "C" {
 
 struct Worker {
     runq: SegQueue<Runnable>,
-    efd: RawFd, // per-worker doorbell (EFD_NONBLOCK); no sharing => no herd
+    // Per-worker doorbell (nonblocking); no sharing => no herd. Uses the same
+    // platform abstraction as the completion doorbell — eventfd on Linux, a
+    // self-pipe on macOS/BSD — so this file is OS-agnostic. The Go side is
+    // already doorbell-agnostic (goexecWorker reads up to 8 bytes, then drains
+    // the queue to empty), so the primitive swap needs no Go change.
+    bell: Doorbell,
 }
 struct Exec {
     workers: Vec<Worker>,
@@ -43,24 +49,11 @@ struct Exec {
 }
 static EXEC: OnceLock<Exec> = OnceLock::new();
 
-fn make_eventfd() -> RawFd {
-    let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
-    assert!(fd >= 0, "eventfd: {}", std::io::Error::last_os_error());
-    fd
-}
-
 fn schedule(runnable: Runnable) {
     let ex = EXEC.get().expect("goexec not initialized");
     let w = ex.next.fetch_add(1, Ordering::Relaxed) % ex.workers.len();
     ex.workers[w].runq.push(runnable);
-    let one: u64 = 1;
-    unsafe {
-        libc::write(
-            ex.workers[w].efd,
-            &one as *const u64 as *const libc::c_void,
-            8,
-        )
-    };
+    ex.workers[w].bell.ring();
 }
 
 /// Create N workers (queues + doorbell fds). Idempotent.
@@ -70,17 +63,18 @@ pub extern "C" fn sable_goexec_init(n: c_int) {
         workers: (0..n.max(1))
             .map(|_| Worker {
                 runq: SegQueue::new(),
-                efd: make_eventfd(),
+                bell: Doorbell::new(),
             })
             .collect(),
         next: AtomicUsize::new(0),
     });
 }
 
-/// The doorbell fd for worker `i` (Go parks on it via the netpoller).
+/// The doorbell fd for worker `i` (Go parks on it via the netpoller). This is
+/// the *read* end: an eventfd on Linux, the read half of a self-pipe elsewhere.
 #[unsafe(no_mangle)]
 pub extern "C" fn sable_goexec_worker_efd(i: c_int) -> c_int {
-    EXEC.get().unwrap().workers[i as usize].efd
+    EXEC.get().unwrap().workers[i as usize].bell.read_fd()
 }
 
 /// Drain and run all runnables queued for worker `i` (on the calling Go M).

@@ -6,5 +6,7 @@ package sable
 // libsable.a from rust/target/release. The portable/http/rust2go builds prepend
 // their own -L via CGO_LDFLAGS (searched first) but still resolve -lsable here.
 
-// #cgo LDFLAGS: -L${SRCDIR}/rust/target/release -lsable -lgcc_s -lutil -lrt -lpthread -lm -ldl
+// #cgo LDFLAGS: -L${SRCDIR}/rust/target/release -lsable
+// #cgo linux LDFLAGS: -lgcc_s -lutil -lrt -lpthread -lm -ldl
+// #cgo darwin LDFLAGS: -liconv
 import "C"

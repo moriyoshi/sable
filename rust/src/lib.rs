@@ -280,16 +280,30 @@ impl SableRuntime {
 // eventfd is a VALUE channel (Go writes the computed u64, Rust reads it), not a
 // bare doorbell. The core completion doorbell uses the platform-abstracted
 // `doorbell::Doorbell` instead (eventfd on Linux, self-pipe elsewhere).
+//
+// LINUX-ONLY, and unlike the doorbell this one does not fall back to a
+// self-pipe. A doorbell is one-way and valueless, so one fd serves both ends;
+// this channel carries a u64 *and* is registered with Go's netpoller under a
+// single fd (`sable_go_compute(kind, arg, efd)` hands Go the same fd Rust awaits
+// via `GoAsyncFd`). A pipe/socketpair has distinct read and write ends, so
+// porting it means widening that C ABI to two fds and reworking the fd-ownership
+// close protocol — which is explicitly fd-reuse-race-sensitive (see
+// `rust_awaits_go`). That is real design work, not a mechanical swap, and it
+// buys nothing today: this whole flow is demo/benchmark surface
+// (`sable_spawn_rust_awaits_go` and `sable_future_new` kind 5), used by Sable's
+// own examples and by no embedder. So it compiles on Linux only; non-Linux
+// targets simply do not get those two demo entry points. See README
+// "Operating systems".
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "fast")]
+#[cfg(all(feature = "fast", target_os = "linux"))]
 fn eventfd_nonblock() -> RawFd {
     let fd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
     assert!(fd >= 0, "eventfd: {}", std::io::Error::last_os_error());
     fd
 }
 
-#[cfg(feature = "fast")]
+#[cfg(all(feature = "fast", target_os = "linux"))]
 fn eventfd_read(fd: RawFd) -> u64 {
     let mut buf = [0u8; 8];
     let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, 8) };
@@ -340,7 +354,8 @@ pub(crate) fn cpu_work(arg: u64) -> u64 {
 
 /// A tokio task awaits a Go computation over an eventfd whose readiness is
 /// delivered by **Go's netpoller** (via [`GoAsyncFd`]) — not tokio's reactor.
-#[cfg(feature = "fast")]
+/// Linux-only: see the eventfd-helpers comment above.
+#[cfg(all(feature = "fast", target_os = "linux"))]
 async fn rust_awaits_go(kind: u32, arg: u64) -> u64 {
     let efd = eventfd_nonblock();
     let afd = GoAsyncFd::new(efd);
@@ -402,7 +417,8 @@ async fn go_read_pipe(fd: RawFd, nbytes: usize) -> u64 {
 // FFI: Go -> Rust
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "fast")]
+// Linux-only along with its sole caller, `rust_awaits_go` (eventfd value channel).
+#[cfg(all(feature = "fast", target_os = "linux"))]
 extern "C" {
     /// Go `//export`: compute-and-signal for the "Rust awaits Go" direction.
     fn sable_go_compute(kind: u32, arg: u64, efd: RawFd);
@@ -506,6 +522,13 @@ pub extern "C" fn sable_spawn_await(rt: *const SableRuntime, kind: u32, arg: u64
 }
 
 /// Go awaits (Rust awaits Go): both directions in one flow, no thread pinned.
+///
+/// Present on every target so the C ABI stays uniform — `bridge_fast.go` calls
+/// this unconditionally, so gating the symbol out would break the Go link off
+/// Linux. Off Linux the eventfd *value channel* it demonstrates is unavailable
+/// (see the eventfd-helpers comment above), so it falls back to the same plain
+/// compute that `sable_future_new` kind 5 uses there. It still completes its
+/// token, so a waiting goroutine never hangs.
 #[unsafe(no_mangle)]
 #[cfg(feature = "fast")]
 pub extern "C" fn sable_spawn_rust_awaits_go(
@@ -518,7 +541,10 @@ pub extern "C" fn sable_spawn_rust_awaits_go(
     let inner = rt.inner.clone();
     inner.note_spawn();
     rt.handle.spawn(async move {
+        #[cfg(target_os = "linux")]
         let result = rust_awaits_go(kind, arg).await;
+        #[cfg(not(target_os = "linux"))]
+        let result = run_demo(kind, arg).await;
         inner.complete(token, result);
     });
 }
@@ -580,10 +606,13 @@ type InlineFut = Pin<Box<dyn Future<Output = u64> + Send>>;
 
 /// Create a persistent future. kind 2/4 = compute (never suspends); kind 5 =
 /// awaits a Go computation over Go's netpoll (suspends → exercises the fallback).
+/// kind 5 is Linux-only (eventfd value channel); elsewhere it falls through to
+/// `run_demo`, so the entry point itself stays present on every target.
 #[unsafe(no_mangle)]
 #[cfg(feature = "fast")]
 pub extern "C" fn sable_future_new(kind: u32, arg: u64) -> *mut InlineFut {
     let fut: InlineFut = match kind {
+        #[cfg(target_os = "linux")]
         5 => Box::pin(rust_awaits_go(1, arg)),
         _ => Box::pin(run_demo(kind, arg)),
     };

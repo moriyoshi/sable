@@ -85,6 +85,7 @@ func TestNoResourceLeak(t *testing.T) {
 // TestSingleEpollUnderLoad re-asserts the single-shared-epoll invariant after a
 // burst of concurrent fused I/O, with the tokio time driver active.
 func TestSingleEpollUnderLoad(t *testing.T) {
+	skipNonLinux(t, "the single-shared-epoll invariant")
 	done := make(chan struct{}, 400)
 	for i := 0; i < 400; i++ {
 		go func(i int) {

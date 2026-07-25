@@ -5,10 +5,23 @@ package sable
 import (
 	"fmt"
 	"os"
+	"runtime"
 	"sync"
 	"syscall"
 	"testing"
 )
+
+// skipNonLinux skips assertions that are Linux-only by design: the
+// rust_awaits_go eventfd value channel (a Go computation awaited over Go's
+// netpoll — see rust/src/lib.rs) and the single-shared-epoll invariant
+// (countEpollFds reads /proc/self/fd for [eventpoll]). Off Linux these paths
+// fall back to a plain Rust-side compute and there is no epoll to count.
+func skipNonLinux(t *testing.T, what string) {
+	t.Helper()
+	if runtime.GOOS != "linux" {
+		t.Skipf("%s is Linux-only by design", what)
+	}
+}
 
 func TestMain(m *testing.M) {
 	raiseFDLimit() // the Rust-awaits-Go stress creates many transient eventfds
@@ -41,6 +54,7 @@ func TestGoAwaitsRust(t *testing.T) {
 
 // TestRustAwaitsGo — direction (ii), single shot.
 func TestRustAwaitsGo(t *testing.T) {
+	skipNonLinux(t, "rust_awaits_go (eventfd value channel)")
 	if got := demoRustAwaitsGo(0, 0); got != 7 {
 		t.Fatalf("demoRustAwaitsGo(0,0) = %d, want 7", got)
 	}
@@ -63,6 +77,7 @@ func TestGoExec(t *testing.T) {
 // completion doorbell and a fused fd, there is exactly ONE epoll in the process
 // (Go's netpoll). tokio, running IO-disabled, owns none.
 func TestSingleEpoll(t *testing.T) {
+	skipNonLinux(t, "the single-shared-epoll invariant")
 	if got := awaitRust(0, 0); got != 42 { // ensures the poller is initialized
 		t.Fatalf("awaitRust = %d, want 42", got)
 	}

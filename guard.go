@@ -28,6 +28,7 @@ import (
 // SupportedGoVersions: toolchains certified via `make abi-check`.
 var SupportedGoVersions = []string{
 	"go1.26.4",
+	"go1.26.5",
 }
 
 // Verified reports whether the running toolchain's internal ABI is certified.
