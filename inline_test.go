@@ -22,6 +22,10 @@ func TestInline(t *testing.T) {
 		t.Fatalf("awaitInline(4,77)=%d want 77", got)
 	}
 	// Pending fallback (kind 5 suspends awaiting a Go computation over netpoll).
+	// kind 5 rides the rust_awaits_go eventfd value channel, which is Linux-only
+	// by design; off Linux sable_future_new kind 5 falls through to run_demo and
+	// the suspending fallback path has nothing to exercise.
+	skipNonLinux(t, "the kind-5 (rust_awaits_go) inline fallback")
 	if got := awaitInline(5, 12345); got != 12345 {
 		t.Fatalf("awaitInline(5,12345)=%d want 12345 (fallback path)", got)
 	}

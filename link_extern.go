@@ -14,5 +14,6 @@ package sable
 // the embedder's combined lib instead of libsable.a. Only the system libs sable's
 // Rust runtime needs remain here.
 
-// #cgo LDFLAGS: -lgcc_s -lutil -lrt -lpthread -lm -ldl
+// #cgo linux LDFLAGS: -lgcc_s -lutil -lrt -lpthread -lm -ldl
+// #cgo darwin LDFLAGS: -liconv
 import "C"

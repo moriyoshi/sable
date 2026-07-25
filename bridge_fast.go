@@ -32,7 +32,7 @@ func awaitRustAwaitsGo(kind uint32, arg uint64) uint64 {
 // entirely from Go's netpoll. Returns the number of bytes Rust read.
 func readPipeViaRust(nbytes, chunks int) uint64 {
 	var fds [2]int
-	if err := syscall.Pipe2(fds[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC); err != nil {
+	if err := nonblockingPipe(&fds); err != nil {
 		panic(err)
 	}
 	rfd, wfd := fds[0], fds[1]

@@ -61,7 +61,7 @@ func TestCanaryGoparkGoready(t *testing.T) {
 // with the netpoller, park in pollWait, wake it by writing the pipe.
 func TestCanaryNetpoll(t *testing.T) {
 	var fds [2]int
-	if err := syscall.Pipe2(fds[:], syscall.O_NONBLOCK|syscall.O_CLOEXEC); err != nil {
+	if err := nonblockingPipe(&fds); err != nil {
 		t.Fatal(err)
 	}
 	r, w := fds[0], fds[1]
