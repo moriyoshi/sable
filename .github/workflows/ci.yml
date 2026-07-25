@@ -105,4 +105,12 @@ jobs:
           SABLE_ALLOW_UNVERIFIED_GO: "1"
         run: |
           cargo build --release --manifest-path rust/Cargo.toml
-          gotip test -race -count=1 -run '^TestCanary' -v .
+          # Go tip dropped the //go:linkname push directives on
+          # internal/runtime/atomic.* (Load/Load64/Cas/Xchg/Store64), so under the
+          # default -checklinkname=1 the linker rejects our pulls of them
+          # (park.go's g0-safe await-slot atomics). That is a linker POLICY change,
+          # not an ABI/behavior change — the primitives still work. This tripwire's
+          # job is to certify that BEHAVIOR via the canaries, so relax the policy
+          # here to let them link and run. The certified `verify` job keeps the
+          # default -checklinkname=1 as the real gate for shipped code.
+          gotip test -ldflags=-checklinkname=0 -race -count=1 -run '^TestCanary' -v .
