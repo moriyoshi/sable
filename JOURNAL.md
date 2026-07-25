@@ -639,6 +639,51 @@ is tracked in the open follow-ups below.
 
 ---
 
+## macOS: the fast path did not actually compile (eventfd outside the doorbell)
+
+- **Symptom.** A downstream embedder (imbh-go) cross-building the combined staticlib
+  for `aarch64-apple-darwin` / `x86_64-apple-darwin` in CI failed with 6 × `E0425`:
+  `cannot find function eventfd` / `EFD_NONBLOCK` / `EFD_CLOEXEC` in `libc`. No Go
+  step involved — the Rust lib itself does not build for Apple targets.
+- **Why the README was wrong.** It claimed the completion doorbell was "the one
+  genuinely OS-specific piece" and that macOS needed "no further Rust/Go changes
+  beyond certification". `doorbell.rs` *is* properly abstracted, but two other sites
+  used `libc::eventfd` unconditionally: `goexec.rs` (per-worker doorbells, via its own
+  duplicate `make_eventfd`) and `lib.rs` (the `rust_awaits_go` helpers). The
+  `SABLE_PIPE_DOORBELL=1` test mode only exercised the *completion* doorbell, so this
+  never showed up on Linux.
+- **Fix 1 — `goexec.rs` onto `Doorbell`.** `Worker.efd: RawFd` → `Worker.bell:
+  Doorbell`, `make_eventfd()` deleted, the raw 8-byte `libc::write` in `schedule()` →
+  `bell.ring()` (which already sizes the write per primitive), and
+  `sable_goexec_worker_efd` returns `bell.read_fd()`. **No Go change needed** —
+  `goexecWorker` already reads up to 8 bytes then drains the queue, exactly the
+  contract `doorbell.rs` documents. Bonus: `make test-pipe` now covers goexec too, so
+  the self-pipe mode exercises both doorbell users.
+- **Fix 2 — `rust_awaits_go` is Linux-only, deliberately.** Unlike a doorbell, its
+  eventfd is a *value channel* (Go writes a `u64` Rust reads) registered with Go's
+  netpoller under a **single** fd; `sable_go_compute(kind, arg, efd)` hands Go the same
+  fd Rust awaits. A pipe/socketpair has distinct ends, so porting means widening that C
+  ABI to two fds and reworking an fd-ownership close protocol the code itself flags as
+  fd-reuse-race-sensitive. It is demo/benchmark surface used by no embedder, so it is
+  gated to Linux. The two **entry points stay present on every target**
+  (`sable_spawn_rust_awaits_go`, `sable_future_new` kind 5) because `bridge_fast.go`
+  calls them unconditionally — gating the symbols out would break the Go link off
+  Linux. Off Linux they fall back to a plain compute and still complete their token, so
+  no goroutine hangs.
+- **Verification.** `cargo check --target {aarch64,x86_64}-apple-darwin` is clean with
+  zero warnings — and needs **no macOS SDK**, since `check` never links, so this is
+  enforceable from a Linux box and worth wiring into CI. Linux is unchanged (every new
+  `cfg` is `target_os = "linux"`): `make test`, `make test-safe`, `make test-pipe` all
+  green under `-race`, and `TestGoExec` passes 3/3 under `SABLE_PIPE_DOORBELL=1`,
+  which is the macOS primitive. Pre-existing and untouched: 32 `not_unsafe_ptr_arg_deref`
+  clippy errors (identical count at the parent commit) and `cargo fmt` drift in
+  `pure_bench.rs` / `registry.rs` / unrelated `lib.rs` sites.
+- **Still open.** Real-hardware certification (`GOOS=darwin make abi-check`); the
+  `/proc/self/{fd,status}` assertions in the fast-only stress/robust suites; and the
+  two-fd port of the value channel if an embedder ever needs it.
+
+---
+
 ## Standing project facts
 
 - `go.mod` pins `toolchain go1.26.4`; **any Go upgrade is an ABI re-audit**. The

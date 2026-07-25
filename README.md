@@ -490,9 +490,10 @@ a Go handler), symmetric in principle but not built out.
 operation) and distinguishing a handler panic from a cancel are remaining refinements.
 
 **Platform coverage.** Linux/amd64 + Linux/arm64 are certified for the full fast build.
-macOS is code-complete pending certification on real hardware; Windows needs an IOCP
-doorbell (portable fallback otherwise). The `/proc/self/{fd,status}` leak assertions are
-Linux-only. See [Portability](#portability).
+macOS *compiles* for both Apple targets and is pending certification on real hardware,
+minus the Linux-only `rust_awaits_go` demo path; Windows needs an IOCP doorbell (portable
+fallback otherwise). The `/proc/self/{fd,status}` leak assertions are Linux-only. See
+[Portability](#portability).
 
 **Toolchain fragility.** Every linknamed symbol carries no compatibility promise, so
 **any Go upgrade is an ABI re-audit**, gated by `make abi-check` (below).
@@ -605,14 +606,15 @@ toolchain, trading away the single-epoll pump, goexec, and inline paths for dura
 Go's netpoll already abstracts epoll/kqueue/IOCP, and the linknamed symbols are the **same
 on every port**, so the fast path is OS-agnostic *at the source level* — Sable never
 touches the raw poller, and each `(Go × GOOS × GOARCH)` just needs `make abi-check`
-certification. The one genuinely OS-specific piece is the Rust→Go **completion doorbell**,
-a pure wakeup signal (the `(token, result)` payload rides `Inner.completed`; the doorbell
-only says "drain the queue"), abstracted behind `rust/src/doorbell.rs`:
+certification. The OS-specific pieces are all *fd primitives*. The main one is the Rust→Go
+**completion doorbell**, a pure wakeup signal (the `(token, result)` payload rides
+`Inner.completed`; the doorbell only says "drain the queue"), abstracted behind
+`rust/src/doorbell.rs`. `goexec`'s per-worker doorbells go through the same abstraction.
 
 | Platform | Doorbell | Status |
 |---|---|---|
 | Linux | `eventfd` (counter-coalescing, one fd) | shipped, default |
-| macOS / BSD | **self-pipe** (`pipe(2)` + nonblocking; Go waits via kqueue) | code-complete, `#[cfg(unix)]` |
+| macOS / BSD | **self-pipe** (`pipe(2)` + nonblocking; Go waits via kqueue) | compiles for both Apple targets; pending hardware certification |
 | Windows | IOCP-associated handle (see below) | follow-on |
 
 The Go dispatcher is doorbell-agnostic — it reads up to 8 bytes then drains the queue to
@@ -622,13 +624,24 @@ both the eventfd and the self-pipe doorbell, in both the default and portable bu
 the single-epoll invariant intact — exercising the exact primitive macOS would use, on a
 box where the race detector runs.
 
-- **macOS (kqueue)** is expected to work today with no further Rust/Go changes beyond
-  certification: build the staticlib for `aarch64-apple-darwin`, run `GOOS=darwin make
-  abi-check` on a certified `(Go, arch)`, and the self-pipe doorbell is selected
-  automatically (`#[cfg(not(target_os = "linux"))]`). Remaining port work: the
-  `/proc/self/{fd,status}` fd/thread-leak assertions are Linux-only (`TestTeardownNoLeak`
-  already `t.Skip`s off Linux; the fast-only stress/robust suites that read `/proc` are the
-  rest).
+- **macOS (kqueue)**: the Rust side **compiles** for `aarch64-apple-darwin` and
+  `x86_64-apple-darwin` (`cargo check` needs no macOS SDK, so this is enforceable from a
+  Linux box), and the self-pipe doorbell is selected automatically
+  (`#[cfg(not(target_os = "linux"))]`). To certify: build the staticlib for the Apple
+  target and run `GOOS=darwin make abi-check` on a certified `(Go, arch)`.
+
+  Remaining port work: (a) the fast-path **`rust_awaits_go` demo flow is Linux-only** —
+  unlike the doorbell, its eventfd is a *value channel* (Go writes a `u64` that Rust reads)
+  registered with Go's netpoller under a **single** fd, whereas a pipe/socketpair has
+  distinct ends; porting it means widening `sable_go_compute` to two fds and reworking an
+  fd-ownership close protocol that is explicitly fd-reuse-race-sensitive. It is demo /
+  benchmark surface used by no embedder, so off Linux both of its entry points
+  (`sable_spawn_rust_awaits_go`, `sable_future_new` kind 5) stay present — the C ABI is
+  uniform, since `bridge_fast.go` calls them unconditionally — and fall back to a plain
+  compute, still completing their token so no goroutine hangs.
+  (b) the `/proc/self/{fd,status}` fd/thread-leak assertions are Linux-only
+  (`TestTeardownNoLeak` already `t.Skip`s off Linux; the fast-only stress/robust suites
+  that read `/proc` are the rest).
 - **Windows (IOCP)** is the larger lift: there is no fd/self-pipe model, so the doorbell
   needs a handle **associated with the runtime's IOCP** (likely a named pipe or loopback
   socketpair Go can poll) — the real design work — and the asmcgocall/linkname surface plus
