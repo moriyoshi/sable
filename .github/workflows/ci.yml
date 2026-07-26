@@ -88,6 +88,40 @@ jobs:
           CGO_ENABLED=1 CGO_LDFLAGS="-L$(pwd -W)/rust/target/x86_64-pc-windows-gnu/release" \
             go test -tags sable_portable -count=1 ./...
 
+  # Windows/amd64 FAST build, NATIVE ("fast crossing on Windows"). The fast path
+  # MINUS fd fusion — the asmcgocall crossing, gopark/goready await, inline poll,
+  # and the goexec executor — is OS-neutral and compiles for Windows; fd fusion
+  # (the single-shared-epoll pump) stays Unix-only because Windows netpoll is IOCP
+  # (completion-based), not readiness-based (README "Operating-system support").
+  # This job builds the FAST staticlib (default features) into its OWN target dir
+  # (so it never clobbers the portable lib the job above builds) and runs the
+  # OS-neutral fast suite natively — the TestCanary* cases certify the
+  # asmcgocall/gopark/goready/internal-atomics ABI on windows/amd64. (Race detector
+  # is unavailable on this cgo path; the Linux/macOS jobs are the -race gate.)
+  verify-windows-fast:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Build the fast staticlib + run the OS-neutral fast suite (native windows/amd64)
+        run: |
+          cargo build --release --manifest-path rust/Cargo.toml \
+            --target x86_64-pc-windows-gnu --target-dir rust/target-win-fast
+          CGO_ENABLED=1 CGO_LDFLAGS="-L$(pwd -W)/rust/target-win-fast/x86_64-pc-windows-gnu/release" \
+            go test -count=1 -v .
+      - name: Build the fast demo binary (link check, windows/amd64)
+        run: |
+          CGO_ENABLED=1 CGO_LDFLAGS="-L$(pwd -W)/rust/target-win-fast/x86_64-pc-windows-gnu/release" \
+            go build -o sable-demo.exe ./cmd/sable-demo
+
   # Concurrency + memory-safety cores (see README "Verification"). Arch-independent,
   # so one runner suffices.
   verification:

@@ -14,6 +14,7 @@
 *.test
 *.out
 
-# Windows/Wine harness artifacts (make test-wine / ci/wine-suite.sh).
+# Windows/Wine harness artifacts (make test-wine{,-fast} / ci/wine-suite*.sh).
 /sable_win_test.exe
+/sable_win_fast_test.exe
 /.wineprefix/

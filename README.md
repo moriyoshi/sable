@@ -491,9 +491,11 @@ operation) and distinguishing a handler panic from a cancel are remaining refine
 
 **Platform coverage.** Linux/amd64 + Linux/arm64 are certified for the full fast build.
 macOS *compiles* for both Apple targets and is pending certification on real hardware,
-minus the Linux-only `rust_awaits_go` demo path; Windows needs an IOCP doorbell (portable
-fallback otherwise). The `/proc/self/{fd,status}` leak assertions are Linux-only. See
-[Portability](#portability).
+minus the Linux-only `rust_awaits_go` demo path. Windows runs the portable fallback **and**
+the fast path *minus fd fusion* (the crossing/await/goexec machinery, natively in CI); fd
+fusion (the single-epoll pump) stays Unix-only, since Windows netpoll is IOCP
+(completion-based), not readiness-based. The `/proc/self/{fd,status}` leak assertions are
+Linux-only. See [Portability](#portability).
 
 **Toolchain fragility.** Every linknamed symbol carries no compatibility promise, so
 **any Go upgrade is an ABI re-audit**, gated by `make abi-check` (below).
@@ -615,7 +617,7 @@ certification. The OS-specific pieces are all *fd primitives*. The main one is t
 |---|---|---|
 | Linux | `eventfd` (counter-coalescing, one fd) | shipped, default |
 | macOS / BSD | **self-pipe** (`pipe(2)` + nonblocking; Go waits via kqueue) | **verified in CI** (`verify-macos`, full `make verify-all`) on Apple-Silicon |
-| Windows | anonymous **pipe** (`CreatePipe`; Go blocking-reads the read HANDLE) | portable fallback **built + run natively in CI** (`verify-windows`, windows/amd64); fast path is a follow-on |
+| Windows | anonymous **pipe** (`CreatePipe`; Go blocking-reads the read HANDLE) | portable fallback **+ fast path (minus fd fusion)** built + run natively in CI (`verify-windows`, `verify-windows-fast`, windows/amd64); fd fusion (the single-epoll pump) stays Unix-only |
 
 The Go dispatcher is doorbell-agnostic — it reads up to 8 bytes then drains the queue to
 empty — so switching primitives needs no Go change. The self-pipe path is **tested on
@@ -653,10 +655,23 @@ by the `verify-macos` CI job (where it is the default doorbell).
   **natively on a `windows-latest` CI runner** (`verify-windows`, staticlib target
   `x86_64-pc-windows-gnu` to match the runner's mingw gcc that cgo uses); for non-Windows dev
   boxes `make test-wine` cross-compiles and runs the same suite under **Wine**.
-  Only `doorbell.rs` was `std::os::unix`-only in the portable path (`reactor.rs`/`goexec.rs`
-  and every other `RawFd` use are `#[cfg(feature = "fast")]`), so the fast path is the
-  remaining Windows lift: an IOCP-associated doorbell handle plus re-certifying the
-  asmcgocall/linkname surface and the P-retake/STW assumptions for `windows/amd64`.
+- **Windows (fast path, minus fd fusion)** also builds and runs. The fast path is
+  really two separable things: the **crossing/await machinery** — the `asmcgocall`
+  fast crossing, `gopark`/`goready` await, the inline-poll path, and the `goexec`
+  Go-M-driven executor — and **fd fusion**, the single-shared-epoll pump that
+  registers a foreign fd with Go's netpoller. The first is a *scheduler* property
+  and OS-neutral; it now compiles and links for `windows/amd64` and is exercised by
+  the native **`verify-windows-fast`** CI job (with `make test-wine-fast` as the
+  local Wine counterpart). The `TestCanary*` cases run there certify the
+  asmcgocall/gopark/goready/internal-atomics ABI on Windows. **fd fusion stays
+  Unix-only**: it sources readiness from the netpoller's *readiness* model
+  (epoll/kqueue), which Windows netpoll — **IOCP, completion-based** — does not
+  provide. Porting it is a genuine design project (an IOCP/overlapped-read reactor,
+  or a readiness shim), tracked separately; on Windows the pump, `ReadPipeViaRust`,
+  `CountEpollFds`, and the `sable_fd_ready`/`reactor` surface are compiled out by the
+  `unix` build constraint. The `rust_awaits_go` eventfd *value channel* is likewise
+  Unix-only, so `RustAwaitsGo` on Windows falls back to a plain Rust-side compute
+  (its token still completes).
 
 ### Architectures
 

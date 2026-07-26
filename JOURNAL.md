@@ -847,9 +847,59 @@ gap from the previous entry — the Windows portable fallback now **builds and r
   validated by the native `verify-windows` CI job — Wine-under-qemu on this arm64 box stalls,
   so it was not validatable locally. (A first CI attempt also caught that ubuntu's `wine64`
   package ships only `libwine`, no launcher — moot once CI went native.)
-- **Still open (Windows).** The FAST path on Windows: an IOCP-associated doorbell handle
-  plus re-certifying the asmcgocall/linkname surface and P-retake/STW assumptions for
-  `windows/amd64`. The portable fallback is the Windows coverage until then.
+- **Still open (Windows) → now partly closed.** The FAST path on Windows split into a
+  tractable half (the crossing/await machinery, landed in the next entry) and a design
+  project (fd fusion on IOCP). See below.
+
+---
+
+## Fast crossing on Windows (fast path minus fd fusion)
+
+The fast build is really two separable things, and only one of them is Unix-bound. Split
+them at a build-tag seam and the OS-neutral half compiles, links, and runs on
+`windows/amd64`; the Unix-bound half stays behind a `unix` constraint.
+
+- **The seam is readiness-vs-completion, not "fast-vs-portable".** The crossing/await
+  machinery — the `asmcgocall` fast crossing (`trampoline.go`), `gopark`/`goready` await
+  (`park.go`), inline poll (`inline.go`), and the `goexec` Go-M executor — are *scheduler*
+  properties, OS-neutral by construction. **fd fusion** (the `poll.go` pump +
+  `netpoll_linkname.go` + `reactor.rs`) is the only OS-bound piece: it sources readiness
+  from Go's netpoller's *readiness* model (epoll/kqueue), which **Windows netpoll (IOCP,
+  completion-based) does not provide**. So the gate is `//go:build unix`, not a new tag.
+- **`goexec` was already portable — that was the tell.** `goexec.rs` uses the platform-
+  abstracted `Doorbell` (pipe on Windows), no `RawFd`; only `reactor.rs` is `std::os::unix`.
+  So the executor half of the fast path needed *no* Rust change beyond gating `reactor`,
+  `go_read_pipe`, `sable_spawn_read_pipe`, and `sable_fd_ready` to `#[cfg(all(feature =
+  "fast", unix))]`.
+- **Files that mixed both halves had to be split.** `bridge_fast.go` (kept the OS-neutral
+  `RustAwaitsGo` await; moved the pipe/eventfd plumbing to `bridge_fusion_unix.go`),
+  `api_fast.go` (→ `api_fusion_unix.go` for `ReadPipeViaRust`/`CountEpollFds`),
+  `trampoline.go` (kept `noopAsm`/`asmcgocall`; moved `fdReady` → `trampoline_fusion_unix.go`,
+  because its C helper takes the address of `sable_fd_ready`, which the Windows lib no longer
+  exports). Same split for the `sable_safe` variant. Tests split the same way
+  (`sable_fusion_unix_test.go`, `canary_fusion_unix_test.go`; `robust`/`stress` are wholly
+  fusion so went `&& unix`; `raiseFDLimit` got a `!unix` no-op — Windows has no
+  `RLIMIT_NOFILE`).
+- **`TestCanaryAsmcgocall` is the Windows ABI cert.** It is already `!sable_safe &&
+  !sable_portable` (OS-neutral), so it runs on Windows and directly certifies that the
+  asmcgocall g0-switch + arg-passing works there — the same "scheduler property, not OS
+  property" claim, now under test. The atomics + gopark/goready canaries join it; only the
+  netpoll canary is Unix-gated.
+- **Validated locally to the link boundary; runtime is a CI job.** With mingw-w64 + the
+  rustup `x86_64-pc-windows-gnu` std, the fast staticlib builds and the fast Go **test
+  binary, demo, safe variant, static binary, and all packages link** for `windows/amd64`;
+  `nm` confirms `sable.pump`/`sable.fdReady`/`sable_fd_ready` are **absent** and
+  `asmcgocall`/`gopark`/`goready`/`awaitGoExec` **present**. Native darwin fast+safe stay
+  green under `-race`; portable still links. **Runtime** is left to the new native
+  **`verify-windows-fast`** CI job (builds the fast lib into its own `target-win-fast` dir so
+  it never clobbers the portable lib, runs the OS-neutral suite + canaries) — because this
+  arm64 box's Docker **amd64 emulation is qemu-user**, which segfaults on complex binaries
+  (`rustc --version` core-dumps under it, confirming the earlier finding), so Wine cannot run
+  the exe locally, containerized or not. `make test-wine-fast` / `ci/wine-suite-fast.sh` is
+  the Wine counterpart for boxes with working amd64 Wine.
+- **Still open: real fd fusion on Windows.** An IOCP/overlapped-read reactor (Go owns the
+  read, hands completed buffers to Rust) or a readiness shim — a materially different data
+  path than the Unix "Rust reads after the edge". Tracked as its own project.
 
 ---
 
@@ -881,7 +931,9 @@ gap from the previous entry — the Windows portable fallback now **builds and r
   `Cas`/`Xchg`/`Store64` (Go tip dropped their linkname pushes — see the go-tip
   tripwire note above), **before** that change ships in a stable Go and breaks the
   default `-checklinkname=1` build; macOS certification on real hardware;
-  Windows IOCP doorbell handle; non-Linux `/proc` guards for the fast-only
+  **Windows fd fusion on IOCP** (the crossing/await/goexec half of the fast path
+  now runs on `windows/amd64` — see "Fast crossing on Windows"; what remains is the
+  IOCP/overlapped-read reactor); non-Linux `/proc` guards for the fast-only
   stress/robust suites; inline under `Handle::enter()` (M8) + pooled waker
   registry (M9); a typed codegen layer over the byte Call transport; the reverse
   direction (Rust awaiting a Go handler).

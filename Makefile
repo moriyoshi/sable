@@ -31,7 +31,7 @@ CROSS_CC    ?=
 HTTP_TARGET_DIR := $(RUST_DIR)/target-http
 HTTP_CGO_LDFLAGS := -L$(CURDIR)/$(HTTP_TARGET_DIR)/release
 
-.PHONY: all rust clean test test-safe verify-all bench run cross http run-http test-http abi-check portable test-portable loom fuzz miri test-pipe rust2go run-rust2go test-rust2go gen-rust2go test-multithread test-qemu-amd64 test-wine
+.PHONY: all rust clean test test-safe verify-all bench run cross http run-http test-http abi-check portable test-portable loom fuzz miri test-pipe rust2go run-rust2go test-rust2go gen-rust2go test-multithread test-qemu-amd64 test-wine test-wine-fast
 
 all: $(BIN)
 
@@ -130,6 +130,16 @@ test-wine:
 	@command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "need mingw-w64: brew install mingw-w64  |  apt-get install gcc-mingw-w64-x86-64"; exit 2; }
 	@command -v wine64 >/dev/null || command -v wine >/dev/null || { echo "need wine: brew install --cask wine-stable  |  apt-get install wine64"; exit 2; }
 	bash ci/wine-suite.sh
+
+# Windows/amd64 FAST build via Wine (LOCAL). Same cross-compile + Wine model as
+# test-wine, but builds the default-feature ("fast") lib and runs the OS-neutral
+# fast suite — the "fast crossing on Windows" (asmcgocall crossing, gopark/goready
+# await, inline poll, goexec). fd fusion (the single-epoll pump) is Unix-only and
+# compiled out. The verify-windows-fast CI job is the authoritative native gate.
+test-wine-fast:
+	@command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "need mingw-w64: brew install mingw-w64  |  apt-get install gcc-mingw-w64-x86-64"; exit 2; }
+	@command -v wine64 >/dev/null || command -v wine >/dev/null || { echo "need wine: brew install --cask wine-stable  |  apt-get install wine64"; exit 2; }
+	bash ci/wine-suite-fast.sh
 
 http:
 	cargo build --release --manifest-path $(RUST_DIR)/Cargo.toml --features http --target-dir $(HTTP_TARGET_DIR)

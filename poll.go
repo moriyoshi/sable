@@ -1,8 +1,11 @@
-//go:build !sable_portable
+//go:build !sable_portable && unix
 
 package sable
 
-// poll.go — the Go side of the single-shared-epoll bridge. For each fused fd,
+// poll.go — the Go side of the single-shared-epoll bridge. Unix-only: it sources
+// readiness from Go's netpoller (epoll/kqueue), a readiness model with no Windows
+// analog (Windows netpoll is IOCP, completion-based), so fd fusion is compiled out
+// of the Windows fast build. See README "Operating-system support". For each fused fd,
 // Rust starts a "pump" goroutine here; the pump registers the fd with Go's
 // netpoller and parks in poll_runtime_pollWait. On a readable edge it calls back
 // into Rust (fdReady -> sable_fd_ready), which fires the tokio Waker.

@@ -1,4 +1,10 @@
-//go:build !sable_portable
+//go:build !sable_portable && unix
+
+// stress_test.go — throughput benchmarks and soak/leak stress for the fusion
+// path. Unix-only: the soak/leak assertions read the `pumps` registry and
+// /proc fd accounting, which the Windows fast build does not have. (The
+// OS-neutral awaitRust/awaitGoExec throughput is still covered by the
+// cross-platform correctness tests.)
 
 package sable
 
