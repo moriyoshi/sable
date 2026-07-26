@@ -8,24 +8,27 @@ import (
 	"github.com/moriyoshi/sable"
 )
 
-// fusionDemo (Windows fast build): fd fusion — a foreign fd whose readiness comes
-// from Go's netpoll — is Unix-only, because Windows netpoll is IOCP (completion-
-// based), not readiness-based. So the single-shared-epoll pump demo is omitted
-// here. What remains is the OS-neutral fast path: the raw asmcgocall crossing and
-// mutual await via gopark/goready. RustAwaitsGo still runs, but its inner Go
-// computation rides a plain Rust-side compute (kind 0 -> 42) rather than the
-// Unix-only eventfd value channel.
+// fusionDemo (Windows fast build): fd fusion works here too, but with the
+// completion-model contract Windows requires. Windows netpoll is IOCP, so instead
+// of Go shipping readiness edges and Rust doing the read (the Unix path), **Go
+// performs the overlapped read through the runtime's single IOCP and hands Rust
+// the byte count**; the Rust tokio task awaits that completion. tokio still owns
+// no event loop. (RustAwaitsGo's inner Go computation rides a plain Rust-side
+// compute — kind 0 -> 42 — since the eventfd value channel is Unix-only.)
 func fusionDemo() bool {
 	got := sable.CrossingAsm(0x12345678)
 	fmt.Printf("  asmcgocall fast crossing      -> %#x (want 0x12345678)\n", got)
 
 	got2 := sable.RustAwaitsGo(0, 0)
-	fmt.Printf("  tokio task awaited Go         -> %d (want 42; fd fusion omitted)\n", got2)
+	fmt.Printf("  tokio task awaited Go         -> %d (want 42)\n", got2)
 
-	if got != 0x12345678 || got2 != 42 {
+	got3 := sable.ReadPipeViaRust(4096, 4)
+	fmt.Printf("  IOCP read fused to Go netpoll -> %d bytes (want 4096)\n", got3)
+
+	if got != 0x12345678 || got2 != 42 || got3 != 4096 {
 		return false
 	}
 	fmt.Println("       fast crossing (asmcgocall) + mutual await via gopark/goready;")
-	fmt.Println("       fd fusion (single-epoll pump) omitted — Windows netpoll is IOCP")
+	fmt.Println("       fd fusion via Go's single IOCP (Go reads, Rust awaits the count)")
 	return true
 }

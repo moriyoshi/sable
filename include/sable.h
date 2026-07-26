@@ -54,6 +54,16 @@ void sable_spawn_read_pipe(const SableRuntime *rt, int fd, uint64_t nbytes, uint
 /* Called by a Go pump goroutine when fused fd `regid` is readable. */
 void sable_fd_ready(uint64_t regid);
 
+/* Windows fd fusion (IOCP), only in the Windows fast build. Windows netpoll is
+ * completion-based, so Go owns the overlapped read through the runtime IOCP and
+ * delivers the byte count: sable_spawn_read_handle spawns a tokio task that awaits
+ * `regid` then signals `token` with the count; the Go read-pump calls
+ * sable_fd_read_complete(regid, count) when the read finishes. (Declared
+ * unconditionally, like sable_spawn_read_pipe/sable_fd_ready above; Go references
+ * them only under the windows build tag, and Rust cfg-gates the definitions.) */
+void sable_spawn_read_handle(const SableRuntime *rt, uint64_t regid, uint64_t token);
+void sable_fd_read_complete(uint64_t regid, uint64_t count);
+
 /* Inline fast-path floor: create+poll+drop a compute future in one crossing. */
 uint64_t sable_await_inline(uint32_t kind, uint64_t arg);
 

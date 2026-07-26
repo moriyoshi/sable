@@ -50,6 +50,13 @@ mod r2g;
 #[cfg(all(feature = "fast", unix))]
 mod reactor;
 
+// The Windows counterpart of `reactor`: fd fusion on IOCP. Windows netpoll is
+// completion-based, so Go owns the overlapped read through the runtime's single
+// IOCP and delivers the byte count here (a one-shot completion channel, not an
+// edge stream). See win_reactor.rs and bridge_fusion_windows.go.
+#[cfg(all(feature = "fast", windows))]
+mod win_reactor;
+
 // Go-M-driven executor: tokio-style tasks polled on Go's M:N scheduler. OS-neutral
 // (its per-worker doorbell is the platform-abstracted `Doorbell`), so it is part
 // of the fast path on Windows too.
@@ -581,6 +588,37 @@ pub extern "C" fn sable_spawn_read_pipe(
 #[cfg(all(feature = "fast", unix))]
 pub extern "C" fn sable_fd_ready(regid: u64) {
     reactor::on_fd_ready(regid);
+}
+
+// ---------------------------------------------------------------------------
+// Windows fd fusion (IOCP). Inverted contract vs Unix: Go performs the overlapped
+// read through the runtime's single IOCP and delivers the byte count; the Rust
+// task just awaits that one-shot completion. See win_reactor.rs.
+// ---------------------------------------------------------------------------
+
+/// Go awaits Rust awaiting Go's IOCP read: spawn a task that awaits the completion
+/// for `regid` (delivered by the Go read-pump via `sable_fd_read_complete`) and
+/// signals the byte count on `token`. The registration is created BEFORE the task
+/// spawns, so a completion racing ahead of the first poll never misses its slot.
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "fast", windows))]
+pub extern "C" fn sable_spawn_read_handle(rt: *const SableRuntime, regid: u64, token: u64) {
+    let rt = unsafe { &*rt };
+    let inner = rt.inner.clone();
+    inner.note_spawn();
+    let fut = win_reactor::GoRead::new(regid);
+    rt.handle.spawn(async move {
+        let n = fut.await;
+        inner.complete(token, n);
+    });
+}
+
+/// Called by the Go read-pump goroutine when its overlapped IOCP read for `regid`
+/// has finished, delivering the byte `count`. Wakes the awaiting tokio task.
+#[unsafe(no_mangle)]
+#[cfg(all(feature = "fast", windows))]
+pub extern "C" fn sable_fd_read_complete(regid: u64, count: u64) {
+    win_reactor::on_read_complete(regid, count);
 }
 
 /// The non-suspending "inline fast path" floor: create+poll+drop a compute future
