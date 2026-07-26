@@ -741,6 +741,60 @@ three "Still open" items are now closed.
 
 ---
 
+## CI: Darwin + Windows platform jobs (`.github/workflows/ci.yml`)
+
+The two macOS entries above got `make verify-all` green on a local `darwin/arm64`
+box; this makes the platform coverage part of CI rather than a one-off local run.
+Two jobs added; the interesting work was mostly in Windows and in CI hygiene, not
+in the macOS job itself.
+
+- **macOS — `verify-macos`.** Mirrors the Linux `verify` gate exactly: `make
+  verify-all` (abi-check + fast `-race` + `sable_safe` + `test-pipe` + `sable_http`)
+  under `dtolnay/rust-toolchain@stable` + `setup-go 1.26.4`. Green in CI on `macos-14`
+  in ~1 min (the http leg compiles reqwest/axum from scratch on a cold runner). This
+  is the same full suite, now on the self-pipe doorbell + kqueue netpoll instead of
+  eventfd + epoll — the exact primitives the macOS port added.
+- **Intel (`macos-13`) dropped.** First cut matrixed `[macos-14, macos-13]` for
+  arm64 + amd64 parity with the Linux side. But GitHub's Intel macOS runners are
+  scarce: the `macos-13` leg sat in `queued` for **20+ minutes with no assignment**,
+  stalling the whole run (the arm64 leg had long since passed). Dropped it to
+  `macos-14` only — the macOS-specific seams (kqueue, self-pipe) are arch-independent,
+  and the amd64 *ABI* is already certified by the Linux `verify` matrix, so a
+  macOS/amd64 leg bought coverage we already have at the cost of CI reliability.
+- **Windows genuinely does not build — and that shaped the job design.** Unlike
+  macOS, Windows is not a certification gap but a *source* gap: `rust/src/doorbell.rs`
+  opens with `use std::os::unix::io::RawFd;` (and the whole self-pipe model is fd-based),
+  so even the portable staticlib (`--no-default-features --features demo`) fails to
+  compile — the IOCP-associated doorbell handle is unimplemented (a documented
+  follow-on, README "Operating-system support"). There is no green Windows path today.
+- **CI-hygiene finding — a job-level `continue-on-error: true` job still shows a red
+  ✗ check on the PR.** The first Windows cut was an "allowed to fail" build job, by
+  analogy with the `go-tip`/`miri`/`rust2go` tripwires. But those are green *because
+  their commands currently pass*; a job that always fails leaves a red check on the PR
+  even with `continue-on-error` (it only stops the failure from failing the *run* — the
+  per-job check still reports failure). So the PR looked like it was failing CI.
+- **Fix — an expected-failure (xfail) tripwire, the inverse of `go-tip`.** Instead of
+  "allowed to fail", the Windows job *asserts the known gap*: it runs `cargo build` and
+  - if the build **fails** and the stderr matches `os::unix|RawFd` → **green**, emits a
+    `::notice::` that the gap still stands (this is the normal, expected state);
+  - if the build **succeeds** → **red** (`::error::` "promote this tripwire to a real
+    build + `go test -tags sable_portable` job, and add a `#cgo windows LDFLAGS` line"),
+    because Windows support has landed and CI should now actually test it;
+  - if the build fails for **any other reason** → **red**, a new/unexpected breakage to
+    investigate (guards against the job going green on an unrelated toolchain failure).
+  Green today (~45 s), and it flips to an actionable red exactly when the state changes.
+  `go-tip` is green while tip works and red when it breaks; this is the mirror — green
+  while the platform gap holds, red when it closes.
+- **No new link-flags change.** The macOS `#cgo darwin LDFLAGS: -liconv` split from the
+  prior entry already covers the cgo link off Linux; this change is CI + docs only. When
+  Windows support lands it will additionally need a `#cgo windows LDFLAGS` line for the
+  staticlib's system libs (noted in the tripwire's `::error::` message).
+- **Verification.** `verify-macos` green on `macos-14`; `windows-portable-tripwire`
+  green (asserting the gap); all Linux jobs unchanged and green. `make verify-all`
+  re-confirmed exit 0 on local `darwin/arm64` (go1.26.5).
+
+---
+
 ## Standing project facts
 
 - `go.mod` pins `toolchain go1.26.4`; **any Go upgrade is an ABI re-audit**. The

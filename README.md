@@ -614,21 +614,24 @@ certification. The OS-specific pieces are all *fd primitives*. The main one is t
 | Platform | Doorbell | Status |
 |---|---|---|
 | Linux | `eventfd` (counter-coalescing, one fd) | shipped, default |
-| macOS / BSD | **self-pipe** (`pipe(2)` + nonblocking; Go waits via kqueue) | compiles for both Apple targets; pending hardware certification |
-| Windows | IOCP-associated handle (see below) | follow-on |
+| macOS / BSD | **self-pipe** (`pipe(2)` + nonblocking; Go waits via kqueue) | **verified in CI** (`verify-macos`, full `make verify-all`) on Apple-Silicon |
+| Windows | IOCP-associated handle (see below) | follow-on; `windows-portable-tripwire` CI job (allowed to fail) tracks it |
 
 The Go dispatcher is doorbell-agnostic — it reads up to 8 bytes then drains the queue to
 empty — so switching primitives needs no Go change. The self-pipe path is **tested on
 Linux** with `SABLE_PIPE_DOORBELL=1` (`make test-pipe`): the full `-race` suite passes on
 both the eventfd and the self-pipe doorbell, in both the default and portable builds, with
 the single-epoll invariant intact — exercising the exact primitive macOS would use, on a
-box where the race detector runs.
+box where the race detector runs. The self-pipe path is additionally exercised **natively**
+by the `verify-macos` CI job (where it is the default doorbell).
 
-- **macOS (kqueue)**: the Rust side **compiles** for `aarch64-apple-darwin` and
-  `x86_64-apple-darwin` (`cargo check` needs no macOS SDK, so this is enforceable from a
-  Linux box), and the self-pipe doorbell is selected automatically
-  (`#[cfg(not(target_os = "linux"))]`). To certify: build the staticlib for the Apple
-  target and run `GOOS=darwin make abi-check` on a certified `(Go, arch)`.
+- **macOS (kqueue)**: **certified in CI** by the `verify-macos` job, which runs the same
+  full `make verify-all` (abi-check + fast suite + safe variant + self-pipe + http) as the
+  Linux gate, on an Apple-Silicon (`macos-14`) runner. It covers the arch-independent
+  macOS-specific seams (kqueue netpoll, self-pipe doorbell); macOS/amd64 is not run
+  separately since the amd64 ABI is already exercised by the Linux verify matrix. The
+  self-pipe doorbell is selected automatically (`#[cfg(not(target_os = "linux"))]`), and the
+  Go suite skips its Linux-only `/proc` probes off Linux (below).
 
   Remaining port work: (a) the fast-path **`rust_awaits_go` demo flow is Linux-only** —
   unlike the doorbell, its eventfd is a *value channel* (Go writes a `u64` that Rust reads)
