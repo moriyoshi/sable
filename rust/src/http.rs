@@ -70,16 +70,37 @@ pub extern "C" fn sable_http_spawn_get(
     let inner = h.inner.clone();
     let client = h.client.clone();
     h.rt.spawn(async move {
-        let result = match client.get(&url).send().await {
-            Ok(resp) => match resp.bytes().await {
-                Ok(body) => std::str::from_utf8(&body)
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .unwrap_or(u64::MAX - 1),
-                Err(_) => u64::MAX - 2,
-            },
-            Err(_) => u64::MAX,
-        };
+        // A burst of concurrent GETs can overflow the listener's accept queue
+        // (macOS caps the backlog at somaxconn, default 128), and the kernel
+        // answers the excess connections with an RST — surfacing here as a
+        // `send()` connect error. That's a transient localhost condition, not a
+        // fusion failure, so retry the connection a few times with a short
+        // backoff before giving up.
+        let mut result = u64::MAX;
+        for attempt in 0..5u32 {
+            match client.get(&url).send().await {
+                Ok(resp) => {
+                    result = match resp.bytes().await {
+                        Ok(body) => std::str::from_utf8(&body)
+                            .ok()
+                            .and_then(|s| s.trim().parse::<u64>().ok())
+                            .unwrap_or(u64::MAX - 1),
+                        Err(_) => u64::MAX - 2,
+                    };
+                    break;
+                }
+                // Only the initial connect is safe to retry blindly (GET is
+                // idempotent and no response was produced); back off and try
+                // again until we run out of attempts.
+                Err(_) if attempt + 1 < 5 => {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        5 * (attempt as u64 + 1),
+                    ))
+                    .await;
+                }
+                Err(_) => result = u64::MAX,
+            }
+        }
         inner.publish(token, result);
     });
 }
