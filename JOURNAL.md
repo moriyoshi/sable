@@ -795,6 +795,64 @@ in the macOS job itself.
 
 ---
 
+## Emulation harnesses: amd64 under qemu-user + Windows under Wine
+
+Two emulation harnesses so amd64 and Windows can be exercised from an arm64 dev box
+(and Windows in CI without a Windows runner). Closes the `windows-portable-tripwire`
+gap from the previous entry — the Windows portable fallback now **builds and runs**.
+
+- **The qemu-user gotcha that shaped both harnesses: rustc/LLVM segfault under
+  qemu-user.** The first cut ran the whole build *inside* an emulated amd64 container
+  (`docker run --platform linux/amd64` + build). `cargo` died at `rustc -vV` with
+  `SIGSEGV` under qemu-user — reproducible even after pinning `tonistiigi/binfmt` to
+  `qemu-v9.2.2` (a known qemu-user limitation with LLVM's threading/mmap). So the model
+  had to flip: **cross-compile natively, emulate only the test binaries.** A native-arch
+  toolchain image cross-builds with zig as the cgo cross C compiler; binfmt then runs
+  just the resulting amd64 test binaries under qemu. Spike-validated: a dynamic amd64
+  cgo binary runs under qemu in a native arm64 container once `libc6:amd64` is present.
+- **amd64 harness (`make test-qemu-amd64`, LOCAL only).** `ci/Dockerfile.emu` (native
+  Go+Rust+zig) + `ci/emu-suite.sh`. Uses the **gnu** triple, not musl: musl-static would
+  need the shipped `-lgcc_s -lrt -lutil -ldl` cgo flags dropped, whereas gnu keeps
+  `link_default.go` untouched and `libc6:amd64` gives qemu the runtime loader. Both the
+  portable AND the fast (asmcgocall + linkname) suites pass under qemu locally. No CI job
+  — CI already covers amd64 natively; the harness's value is the arm64 dev box. binfmt is
+  installed via a **digest-pinned** `tonistiigi/binfmt` (a bare `multiarch/qemu-user-static
+  --reset` is amd64-only, so it can't self-register from an arm64 host — and `--reset`
+  destructively clobbered Docker Desktop's existing handlers mid-debug).
+- **Windows portable port — only `doorbell.rs` blocked it.** Every `RawFd` use in
+  `lib.rs` is already `#[cfg(feature = "fast")]`-gated and `reactor.rs`/`goexec.rs` are
+  fast-only mods, so in the portable build the *sole* `std::os::unix` dependency was the
+  doorbell. Split it `#[cfg(unix)]` (unchanged eventfd/self-pipe) vs `#[cfg(windows)]`: an
+  anonymous **pipe** (`CreatePipe`), write end set `PIPE_NOWAIT` so `ring()` never blocks
+  the executor when the buffer fills (Go drains the whole logical queue on any wake), read
+  end left blocking. The read HANDLE crosses the existing `sable_completion_efd -> c_int`
+  FFI narrowed to 32 bits (Win32 handles are 32-bit-significant for interop). Go side:
+  `bridge_dup_{unix,windows}.go` split `syscall.Dup` vs `DuplicateHandle`; the dispatcher
+  **blocking-reads** the pipe HANDLE — fine, because the zero-linkname portable build has
+  no netpoller access anyway, and Go's `os.NewFile` on a non-overlapped pipe falls to
+  blocking-on-a-thread. `#cgo windows LDFLAGS` from `rustc --print native-static-libs`:
+  `-lkernel32 -lntdll -luserenv -lws2_32 -ldbghelp`.
+- **Windows CI is NATIVE (`verify-windows` on `windows-latest`); Wine is the local aid.**
+  First cut ran the suite under Wine on an ubuntu runner; switched to a real `windows-latest`
+  runner — the authentic test (real Windows kernel + pipe semantics), and simpler (no
+  cross-compile, no Wine). It builds the staticlib for `x86_64-pc-windows-gnu` (to match the
+  runner's mingw gcc that cgo uses) and `go test -tags sable_portable` natively. For
+  non-Windows dev boxes, `make test-wine` (`ci/wine-suite.sh`) cross-compiles a static cgo
+  test binary via mingw-w64 and runs it under Wine (native on an amd64 host; via Rosetta on
+  Apple Silicon). Replaces the allowed-to-fail tripwire with real coverage.
+- **Local validation reached, and its limits.** Validated locally in Docker: the Rust
+  windows-gnu portable lib compiles; the Go windows/amd64 test binary cross-compiles and
+  statically links (caught one real bug — `syscall.GetCurrentProcess` returns two values on
+  Windows); the amd64 qemu suites pass. The Windows **runtime** (doorbell behavior) is
+  validated by the native `verify-windows` CI job — Wine-under-qemu on this arm64 box stalls,
+  so it was not validatable locally. (A first CI attempt also caught that ubuntu's `wine64`
+  package ships only `libwine`, no launcher — moot once CI went native.)
+- **Still open (Windows).** The FAST path on Windows: an IOCP-associated doorbell handle
+  plus re-certifying the asmcgocall/linkname surface and P-retake/STW assumptions for
+  `windows/amd64`. The portable fallback is the Windows coverage until then.
+
+---
+
 ## Standing project facts
 
 - `go.mod` pins `toolchain go1.26.4`; **any Go upgrade is an ABI re-audit**. The

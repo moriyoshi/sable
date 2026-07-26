@@ -31,7 +31,7 @@ CROSS_CC    ?=
 HTTP_TARGET_DIR := $(RUST_DIR)/target-http
 HTTP_CGO_LDFLAGS := -L$(CURDIR)/$(HTTP_TARGET_DIR)/release
 
-.PHONY: all rust clean test test-safe verify-all bench run cross http run-http test-http abi-check portable test-portable loom fuzz miri test-pipe rust2go run-rust2go test-rust2go gen-rust2go test-multithread
+.PHONY: all rust clean test test-safe verify-all bench run cross http run-http test-http abi-check portable test-portable loom fuzz miri test-pipe rust2go run-rust2go test-rust2go gen-rust2go test-multithread test-qemu-amd64 test-wine
 
 all: $(BIN)
 
@@ -93,6 +93,43 @@ cross:
 	  CGO_LDFLAGS="-L$(CURDIR)/$(RUST_DIR)/target/$(RUST_TARGET)/release" \
 	  go build $(GO_LDFLAGS) -o $(BIN)-$(GOARCH) ./cmd/sable-demo
 	@echo "built $(BIN)-$(GOARCH) ($(GOARCH))"
+
+# Emulated amd64 verification (R-emu, LOCAL). Runs the suite as amd64 under
+# qemu-user — the reproducible form of the README's "amd64 run under qemu-x86_64"
+# claim, for exercising amd64 from an arm64 dev box (CI already covers amd64
+# natively, so there is no CI job for this). Because rustc/LLVM segfault under
+# qemu-user, the toolchain image (ci/Dockerfile.emu) is NATIVE-arch and
+# CROSS-compiles to amd64 with zig; only the resulting test binaries run emulated.
+# Steps: install the qemu-user-static binfmt handlers (tonistiigi/binfmt — the
+# maintained, multi-arch successor to a bare `multiarch/qemu-user-static --reset`,
+# which is amd64-only and so cannot self-register from an arm64 host; usually a
+# no-op on Docker Desktop), build the image, then copy the WORKING TREE (minus the
+# host's target dirs / .git, so native artifacts never leak in) into a throwaway
+# dir and run ci/emu-suite.sh. Race detector is off there (qemu).
+EMU_IMAGE    ?= sable-emu
+# Pinned by digest for reproducibility (tonistiigi/binfmt:qemu-v9.2.2). Bump
+# deliberately — a floating tag would change the emulator with no diff.
+BINFMT_IMAGE ?= tonistiigi/binfmt@sha256:1b804311fe87047a4c96d38b4b3ef6f62fca8cd125265917a9e3dc3c996c39e6
+test-qemu-amd64:
+	docker run --privileged --rm $(BINFMT_IMAGE) --install amd64
+	docker build -f ci/Dockerfile.emu -t $(EMU_IMAGE) ci
+	docker run --rm -v $(CURDIR):/src:ro $(EMU_IMAGE) bash -euc '\
+	  mkdir -p /work && cd /src && \
+	  tar --exclude=./.git --exclude=./rust/target --exclude="./rust/target-*" -cf - . | (cd /work && tar -xf -) && \
+	  cd /work && bash ci/emu-suite.sh'
+
+# Windows/amd64 via Wine (LOCAL). Cross-compiles the portable Sable to a windows
+# .exe (Rust staticlib + cgo through mingw-w64) and runs its suite under Wine —
+# how the Windows portable fallback (cross-platform anonymous-pipe doorbell) is
+# exercised without a Windows machine. The build is native (rustc/go cross-
+# compile); only the .exe runs under Wine — native on an amd64 host, via Rosetta
+# on Apple Silicon. The verify-windows-wine CI job runs the same ci/wine-suite.sh.
+# Requires on PATH: cargo + the x86_64-pc-windows-gnu rust target
+# (`rustup target add x86_64-pc-windows-gnu`), x86_64-w64-mingw32-gcc, go, wine.
+test-wine:
+	@command -v x86_64-w64-mingw32-gcc >/dev/null || { echo "need mingw-w64: brew install mingw-w64  |  apt-get install gcc-mingw-w64-x86-64"; exit 2; }
+	@command -v wine64 >/dev/null || command -v wine >/dev/null || { echo "need wine: brew install --cask wine-stable  |  apt-get install wine64"; exit 2; }
+	bash ci/wine-suite.sh
 
 http:
 	cargo build --release --manifest-path $(RUST_DIR)/Cargo.toml --features http --target-dir $(HTTP_TARGET_DIR)

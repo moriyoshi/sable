@@ -60,40 +60,33 @@ jobs:
       - name: Full verify (abi-check + suite + safe variant + http)
         run: make verify-all
 
-  # Windows tripwire. Windows has no fd/self-pipe model, so the Rust doorbell
-  # (rust/src/doorbell.rs) is still `std::os::unix`-only and the portable
-  # staticlib does not build there yet — the IOCP-associated doorbell handle is
-  # an unimplemented follow-on (README "Operating-system support"). Rather than
-  # an allowed-to-fail job (which still shows a red ✗ on the PR), this ASSERTS
-  # the known gap: it is GREEN while the gap stands and turns RED the day the
-  # build starts working — the signal to promote it into a real Windows
-  # build + `go test -tags sable_portable` job. The inverse of the go-tip
-  # tripwire: green means "the platform state is still as documented".
-  windows-portable-tripwire:
+  # Windows/amd64, NATIVE on a windows-latest runner (README "Operating-system
+  # support"). The portable fallback now compiles for Windows — doorbell.rs has a
+  # cross-platform anonymous-pipe doorbell (#[cfg(windows)]) and the Go dispatcher
+  # blocking-reads it (bridge_dup_windows.go). Build its staticlib for
+  # x86_64-pc-windows-gnu (to match the runner's mingw gcc that cgo uses) and run
+  # the suite natively — the authentic Windows test, no Wine, no cross-compile.
+  # (Race detector is unavailable on this path; the Linux/macOS jobs are the gate.)
+  # Locally, `make test-wine` runs the same suite under Wine for non-Windows devs.
+  verify-windows:
     runs-on: windows-latest
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.4"
       - uses: dtolnay/rust-toolchain@stable
-      - name: Assert the portable staticlib still doesn't build (unix-only doorbell)
+        with:
+          targets: x86_64-pc-windows-gnu
+      - name: Build the portable staticlib + run the suite (native windows/amd64)
         run: |
-          if cargo build --release --manifest-path rust/Cargo.toml \
-               --no-default-features --features demo \
-               --target-dir rust/target-portable 2> build.log; then
-            echo "::error::Windows portable staticlib now BUILDS — the IOCP doorbell gap may be closed. Promote this tripwire to a real build + 'go test -tags sable_portable' job (and add a '#cgo windows LDFLAGS' line for the staticlib's system libs)."
-            exit 1
-          fi
-          if grep -qE 'os::unix|RawFd' build.log; then
-            echo "::notice::Expected: the portable staticlib does not build on Windows yet — the self-pipe doorbell is std::os::unix-only and the IOCP handle is a follow-on (README 'Operating-system support'). Tracking the gap."
-            echo '----- cargo build stderr (tail) -----'
-            tail -n 30 build.log || true
-          else
-            echo "::error::Windows build failed, but NOT at the known unix-only doorbell gap — a new/unexpected failure. Investigate:"
-            tail -n 60 build.log || true
-            exit 1
-          fi
+          cargo build --release --manifest-path rust/Cargo.toml \
+            --no-default-features --features demo --target x86_64-pc-windows-gnu
+          CGO_ENABLED=1 CGO_LDFLAGS="-L$(pwd -W)/rust/target/x86_64-pc-windows-gnu/release" \
+            go test -tags sable_portable -count=1 ./...
 
   # Concurrency + memory-safety cores (see README "Verification"). Arch-independent,
   # so one runner suffices.

@@ -20,7 +20,6 @@ import (
 	"io"
 	"os"
 	"sync/atomic"
-	"syscall"
 )
 
 var (
@@ -57,16 +56,19 @@ func sableInit() {
 		panic("sable_runtime_new failed")
 	}
 	efd := int(C.sable_completion_efd(rt))
-	// DUP the doorbell eventfd: Rust owns and closes the original on teardown,
-	// Go owns and closes this dup. Both refer to the same eventfd object (Rust's
-	// writes are visible to Go's reads), but each side closes its own descriptor,
-	// so shutdown never double-closes. os.NewFile routes reads through the
-	// netpoller (SUPPORTED os API — no linkname); Read parks the goroutine.
-	dupfd, err := syscall.Dup(efd)
+	// DUP the doorbell: Rust owns and closes the original on teardown, Go owns and
+	// closes this dup. Both refer to the same kernel object (Rust's writes are
+	// visible to Go's reads), but each side closes its own descriptor/handle, so
+	// shutdown never double-closes. dupDoorbell is dup(2) on Unix and
+	// DuplicateHandle on Windows (bridge_dup_{unix,windows}.go). os.NewFile routes
+	// reads through the netpoller on Unix (SUPPORTED os API — no linkname); on the
+	// Windows pipe HANDLE it is a blocking read on a dedicated goroutine. Either
+	// way Read parks the dispatcher until the doorbell rings.
+	dupfd, err := dupDoorbell(efd)
 	if err != nil {
-		panic("dup(completion eventfd): " + err.Error())
+		panic("dup(completion doorbell): " + err.Error())
 	}
-	f := os.NewFile(uintptr(dupfd), "sable-completion")
+	f := os.NewFile(dupfd, "sable-completion")
 	if f == nil {
 		panic("os.NewFile(completion eventfd) failed")
 	}
