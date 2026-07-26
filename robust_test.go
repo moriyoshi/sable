@@ -1,4 +1,8 @@
-//go:build !sable_portable
+//go:build !sable_portable && unix
+
+// robust_test.go — leak/teardown regression guards for the fd-fusion path (the
+// pump registry, fused fds, /proc fd + thread accounting). Unix-only: it asserts
+// on `pumps` and /proc, neither of which exists in the Windows fast build.
 
 package sable
 

@@ -2,18 +2,14 @@
 
 package sable
 
-// trampoline_safe.go — the safe fallback for the hot crossing (built with
+// trampoline_safe.go — the safe fallback for the hot crossings (built with
 // -tags sable_safe). Uses the full, always-correct cgo path. This is the
 // permanent correctness backstop: the M1–M3 suite must pass identically under
-// -tags sable_safe and under the default asm fast path.
+// -tags sable_safe and under the default asm fast path. The pump's fd_ready
+// crossing (Unix-only) lives in trampoline_safe_fusion_unix.go.
 
 // #include "sable.h"
 import "C"
-
-//go:nosplit
-func fdReady(regid uint64) {
-	C.sable_fd_ready(C.uint64_t(regid))
-}
 
 func noopCgo(x uint64) uint64 {
 	return uint64(C.sable_noop(C.uint64_t(x)))

@@ -42,10 +42,17 @@ pub use registry::{
 #[cfg(feature = "rust2go")]
 mod r2g;
 
-#[cfg(feature = "fast")]
+// The pump/reactor sources readiness from Go's netpoller, a *readiness* model
+// (epoll/kqueue) that only maps onto Unix. Windows netpoll is IOCP
+// (completion-based), so the fast build there omits fd fusion (see README
+// "Operating-system support"); the rest of the fast path — asmcgocall crossing,
+// gopark/goready, inline poll, and the goexec executor below — is OS-neutral.
+#[cfg(all(feature = "fast", unix))]
 mod reactor;
 
-// Go-M-driven executor: tokio-style tasks polled on Go's M:N scheduler.
+// Go-M-driven executor: tokio-style tasks polled on Go's M:N scheduler. OS-neutral
+// (its per-worker doorbell is the platform-abstracted `Doorbell`), so it is part
+// of the fast path on Windows too.
 #[cfg(feature = "fast")]
 mod goexec;
 
@@ -58,7 +65,7 @@ use std::collections::VecDeque;
 #[cfg(feature = "fast")]
 use std::future::Future;
 use std::os::raw::c_int;
-#[cfg(feature = "fast")]
+#[cfg(all(feature = "fast", unix))]
 use std::os::unix::io::RawFd;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 #[cfg(feature = "fast")]
@@ -69,7 +76,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-#[cfg(feature = "fast")]
+#[cfg(all(feature = "fast", unix))]
 use reactor::GoAsyncFd;
 // Aliased: `Handle` (the crate's public opaque-handle type, re-exported from
 // registry) would otherwise collide with tokio's runtime handle.
@@ -378,7 +385,7 @@ async fn rust_awaits_go(kind: u32, arg: u64) -> u64 {
 /// Read exactly `nbytes` from `fd`, sourcing readiness from Go's netpoller.
 /// Honors the edge-triggered drain contract: read until `EAGAIN` before
 /// awaiting readability again.
-#[cfg(feature = "fast")]
+#[cfg(all(feature = "fast", unix))]
 async fn go_read_pipe(fd: RawFd, nbytes: usize) -> u64 {
     let afd = GoAsyncFd::new(fd);
     let mut buf = vec![0u8; nbytes];
@@ -552,7 +559,7 @@ pub extern "C" fn sable_spawn_rust_awaits_go(
 /// Go awaits Rust doing real I/O: spawn a task that reads `nbytes` from `fd`
 /// (readiness from Go's netpoll), signaling the byte count on completion.
 #[unsafe(no_mangle)]
-#[cfg(feature = "fast")]
+#[cfg(all(feature = "fast", unix))]
 pub extern "C" fn sable_spawn_read_pipe(
     rt: *const SableRuntime,
     fd: RawFd,
@@ -568,9 +575,10 @@ pub extern "C" fn sable_spawn_read_pipe(
     });
 }
 
-/// Called by the Go pump goroutine when a fused fd is readable.
+/// Called by the Go pump goroutine when a fused fd is readable. Fd fusion is
+/// Unix-only (readiness-based netpoll); see the `reactor` mod gate above.
 #[unsafe(no_mangle)]
-#[cfg(feature = "fast")]
+#[cfg(all(feature = "fast", unix))]
 pub extern "C" fn sable_fd_ready(regid: u64) {
     reactor::on_fd_ready(regid);
 }

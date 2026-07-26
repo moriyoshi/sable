@@ -1,4 +1,4 @@
-//go:build !sable_portable
+//go:build !sable_portable && unix
 
 package main
 
