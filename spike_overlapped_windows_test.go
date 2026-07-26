@@ -153,10 +153,11 @@ func TestSpikeBoundedThreads(t *testing.T) {
 
 	delta := peak - base
 	t.Logf("thread count: base=%d peak=%d delta=%d (conc=%d)", base, peak, delta, conc)
-	// Catastrophic thread-per-read shows delta ≈ conc; IOCP shows a handful. Fail
-	// only on the unambiguous thread-per-read signal for now; tighten toward
-	// conc/2 once real runner numbers are observed.
-	if delta > conc*3/4 {
+	// IOCP routing keeps the thread count ~flat (measured delta=0 for conc=256 on
+	// the native runner); a blocking thread-per-read fallback would add ~conc. A
+	// conc/2 bound is a wide margin around the observed behavior while still
+	// catching the thread-per-read regression unambiguously.
+	if delta > conc/2 {
 		t.Errorf("thread count grew by %d under %d concurrent reads — looks like "+
 			"thread-per-read (blocking ReadFile), not IOCP routing", delta, conc)
 	}

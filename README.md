@@ -492,10 +492,10 @@ operation) and distinguishing a handler panic from a cancel are remaining refine
 **Platform coverage.** Linux/amd64 + Linux/arm64 are certified for the full fast build.
 macOS *compiles* for both Apple targets and is pending certification on real hardware,
 minus the Linux-only `rust_awaits_go` demo path. Windows runs the portable fallback **and**
-the fast path *minus fd fusion* (the crossing/await/goexec machinery, natively in CI); fd
-fusion (the single-epoll pump) stays Unix-only, since Windows netpoll is IOCP
-(completion-based), not readiness-based. The `/proc/self/{fd,status}` leak assertions are
-Linux-only. See [Portability](#portability).
+the full fast path (natively in CI), including **fd fusion** — with the completion-based
+contract IOCP requires: Go owns the overlapped read through its single IOCP and hands Rust
+the byte count, rather than the Unix readiness-edge/Rust-reads model. The
+`/proc/self/{fd,status}` leak assertions are Linux-only. See [Portability](#portability).
 
 **Toolchain fragility.** Every linknamed symbol carries no compatibility promise, so
 **any Go upgrade is an ABI re-audit**, gated by `make abi-check` (below).
@@ -617,7 +617,7 @@ certification. The OS-specific pieces are all *fd primitives*. The main one is t
 |---|---|---|
 | Linux | `eventfd` (counter-coalescing, one fd) | shipped, default |
 | macOS / BSD | **self-pipe** (`pipe(2)` + nonblocking; Go waits via kqueue) | **verified in CI** (`verify-macos`, full `make verify-all`) on Apple-Silicon |
-| Windows | anonymous **pipe** (`CreatePipe`; Go blocking-reads the read HANDLE) | portable fallback **+ fast path (minus fd fusion)** built + run natively in CI (`verify-windows`, `verify-windows-fast`, windows/amd64); fd fusion (the single-epoll pump) stays Unix-only |
+| Windows | anonymous **pipe** (`CreatePipe`; Go blocking-reads the read HANDLE) | portable fallback **+ full fast path (incl. fd fusion via IOCP)** built + run natively in CI (`verify-windows`, `verify-windows-fast`, windows/amd64); fd fusion inverts to Go-owns-the-overlapped-read (completion), tokio still owns no event loop |
 
 The Go dispatcher is doorbell-agnostic — it reads up to 8 bytes then drains the queue to
 empty — so switching primitives needs no Go change. The self-pipe path is **tested on
@@ -655,23 +655,34 @@ by the `verify-macos` CI job (where it is the default doorbell).
   **natively on a `windows-latest` CI runner** (`verify-windows`, staticlib target
   `x86_64-pc-windows-gnu` to match the runner's mingw gcc that cgo uses); for non-Windows dev
   boxes `make test-wine` cross-compiles and runs the same suite under **Wine**.
-- **Windows (fast path, minus fd fusion)** also builds and runs. The fast path is
-  really two separable things: the **crossing/await machinery** — the `asmcgocall`
-  fast crossing, `gopark`/`goready` await, the inline-poll path, and the `goexec`
-  Go-M-driven executor — and **fd fusion**, the single-shared-epoll pump that
-  registers a foreign fd with Go's netpoller. The first is a *scheduler* property
-  and OS-neutral; it now compiles and links for `windows/amd64` and is exercised by
-  the native **`verify-windows-fast`** CI job (with `make test-wine-fast` as the
-  local Wine counterpart). The `TestCanary*` cases run there certify the
-  asmcgocall/gopark/goready/internal-atomics ABI on Windows. **fd fusion stays
-  Unix-only**: it sources readiness from the netpoller's *readiness* model
-  (epoll/kqueue), which Windows netpoll — **IOCP, completion-based** — does not
-  provide. Porting it is a genuine design project (an IOCP/overlapped-read reactor,
-  or a readiness shim), tracked separately; on Windows the pump, `ReadPipeViaRust`,
-  `CountEpollFds`, and the `sable_fd_ready`/`reactor` surface are compiled out by the
-  `unix` build constraint. The `rust_awaits_go` eventfd *value channel* is likewise
-  Unix-only, so `RustAwaitsGo` on Windows falls back to a plain Rust-side compute
-  (its token still completes).
+- **Windows (full fast path, including fd fusion)** builds and runs. The fast path
+  is two separable things: the **crossing/await machinery** — the `asmcgocall` fast
+  crossing, `gopark`/`goready` await, the inline-poll path, and the `goexec`
+  Go-M-driven executor — and **fd fusion**, registering a foreign fd's I/O with Go's
+  single netpoller. The first is a *scheduler* property, OS-neutral; it links for
+  `windows/amd64` and the native **`verify-windows-fast`** CI job's `TestCanary*`
+  cases certify the asmcgocall/gopark/goready/internal-atomics ABI there.
+  - **fd fusion uses the contract Windows requires — completion, not readiness.**
+    Unix netpoll is readiness-based (epoll/kqueue): Go ships a readable edge and the
+    Rust task does the `read`. Windows netpoll is **IOCP — completion-based**: there
+    is no readable edge, so the contract inverts. **Go owns the overlapped read**
+    through the runtime's single IOCP (`os.NewFile` on a `FILE_FLAG_OVERLAPPED`
+    handle → `File.Read` parks in the netpoller and wakes on completion) and delivers
+    the byte count to a Rust tokio task, which awaits it via `win_reactor`. tokio
+    still owns no event loop; Go's netpoller stays the sole one. `ReadPipeViaRust`
+    works on Windows this way (`bridge_fusion_windows.go` + `rust/src/win_reactor.rs`;
+    exports `sable_spawn_read_handle` / `sable_fd_read_complete`), and the native CI
+    job asserts both correctness and — via a raw-`kernel32` thread-count probe — that
+    the reads park in the IOCP (bounded threads, measured delta 0 under 256 concurrent
+    reads), not a blocking thread-per-read. This rests on a **go1.26** property:
+    `os.NewFile` detects overlapped mode via `windows.IsNonblock` (a kernel
+    `NtQueryInformationFile` query), so a raw `CreateNamedPipeW(FILE_FLAG_OVERLAPPED)`
+    handle is registered pollable.
+  - **Still Unix-only:** the `rust_awaits_go` eventfd *value channel*, so
+    `RustAwaitsGo` on Windows falls back to a plain Rust-side compute (its token still
+    completes); `CountEpollFds` (a Linux `/proc` concept). Delivering the read
+    *bytes* (not just the count) to Rust and cancellation-integrating the read pump
+    are follow-ons.
 
 ### Architectures
 

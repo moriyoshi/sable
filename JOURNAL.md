@@ -897,9 +897,50 @@ them at a build-tag seam and the OS-neutral half compiles, links, and runs on
   (`rustc --version` core-dumps under it, confirming the earlier finding), so Wine cannot run
   the exe locally, containerized or not. `make test-wine-fast` / `ci/wine-suite-fast.sh` is
   the Wine counterpart for boxes with working amd64 Wine.
-- **Still open: real fd fusion on Windows.** An IOCP/overlapped-read reactor (Go owns the
-  read, hands completed buffers to Rust) or a readiness shim — a materially different data
-  path than the Unix "Rust reads after the edge". Tracked as its own project.
+- **Still open → done in the next entry: real fd fusion on Windows.** An IOCP/overlapped-read
+  reactor (Go owns the read, hands the count to Rust). Landed below.
+
+---
+
+## fd fusion on Windows (IOCP)
+
+The follow-on: make fd fusion — a Rust tokio task awaiting fd I/O driven by Go's single
+event loop — work on Windows, where the loop is IOCP (completion), not epoll (readiness).
+
+- **The contract inverts, and that's the whole design.** Unix: Go ships a readable *edge*,
+  the Rust task does `libc::read`. Windows has no edge — an overlapped read completes only
+  once bytes are already in a buffer. So **Go owns the overlapped read** through the runtime's
+  single IOCP and delivers the *byte count* to Rust; the tokio task just awaits that one-shot
+  completion (`rust/src/win_reactor.rs`, a completion analog of `reactor.rs`). tokio still
+  owns no IOCP; Go's netpoller stays the sole event loop. Even the rejected "inject our own
+  OVERLAPPED via `runtime_pollOpen`" alternative collapses to Go-owns-the-read (the kernel
+  fills the buffer before the wakeup), so it bought only fragility.
+- **The linchpin was a `go1.26` property, confirmed by source before writing a line.**
+  `os.NewFile` → `newFile(kindNewFile)` calls `windows.IsNonblock`, which in go1.26 does a
+  **kernel `NtQueryInformationFile(FileModeInformation)` query** (not an "os-created handles"
+  set lookup, as older Go did). So a raw `CreateNamedPipeW(FILE_FLAG_OVERLAPPED)` handle is
+  detected non-blocking → `pfd.Init(pollable=true)` → registered with the runtime IOCP →
+  `File.Read` parks in `runtime_pollWait`. (`syscall.CreatePipe`/`os.Pipe` make *synchronous*
+  handles, hence the named-pipe workaround via raw `kernel32` — no `x/sys` dep.)
+- **Spike-first, because only the native runner can prove it.** The arm64 box can't run the
+  binaries (qemu-user segfaults). PR 1 was Go-only: `overlappedPipe()` + a Toolhelp
+  thread-counter + three tests, gated on the single unknown — does `os.NewFile` route the
+  overlapped handle through the IOCP, or fall back to a blocking thread-per-read? The
+  `TestSpikeBoundedThreads` result was decisive: **base=16 peak=16 delta=0 under 256 concurrent
+  in-flight reads** — the thread count did not move, i.e. all reads park in the one IOCP.
+  Thread-per-read would have added ~256. Threshold then tightened to `conc/2`.
+- **PR 2 built the feature on that gate.** `win_reactor` (regid → result+waker, arm-then-check
+  race guard, registration inserted *before* the task spawns so a completion racing the first
+  poll never misses), two exports (`sable_spawn_read_handle` / `sable_fd_read_complete`), and
+  `bridge_fusion_windows.go` (`readPipeViaRust` = overlapped pipe + writer + `os.NewFile` read
+  pump + `awaitViaPark`). Every Go→Rust hop is an ordinary cgo call from a valid Go M; the
+  tokio executor pthread only touches `Inner::complete`. **Go owns both pipe ends** and holds
+  no Rust-side fd, so the Unix fd-reuse-race dance is simply absent — `os.File.Close` sequences
+  IOCP-deregister then CloseHandle. `park.go`/`bridge.go`/`Inner::complete` were reused verbatim.
+- **Still open (smaller now).** Delivering the read *bytes* (not just the count) to Rust;
+  porting the `rust_awaits_go` eventfd value channel (so `RustAwaitsGo` returns 7 on Windows);
+  cancellation-integrating the read pump on shutdown (the Unix `read_pipe` demo path isn't
+  either); sockets/duplex.
 
 ---
 
