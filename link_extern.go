@@ -16,4 +16,5 @@ package sable
 
 // #cgo linux LDFLAGS: -lgcc_s -lutil -lrt -lpthread -lm -ldl
 // #cgo darwin LDFLAGS: -liconv
+// #cgo windows LDFLAGS: -lkernel32 -lntdll -luserenv -lws2_32 -ldbghelp
 import "C"

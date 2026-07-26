@@ -1,0 +1,36 @@
+# Emulation harness image (R-emu, local-only). A NATIVE-arch Go + Rust + zig
+# toolchain that CROSS-compiles Sable for another arch. The compilers run native
+# (rustc/LLVM segfault under qemu-user, so building *inside* an emulated container
+# is a non-starter) and only the resulting test binaries execute under qemu — the
+# reproducible form of the README's "amd64 run under qemu-x86_64" claim.
+#
+# amd64 uses the gnu triple: musl-static would require dropping the shipped
+# `-lgcc_s -lrt -lutil -ldl` cgo link flags, whereas gnu keeps link_default.go
+# untouched. libc6:amd64 + libgcc-s1:amd64 give qemu the amd64 loader + runtime
+# libraries the dynamically-linked test binaries need. See `make test-qemu-amd64`.
+FROM golang:1.26.4-bookworm
+
+RUN dpkg --add-architecture amd64 \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential curl ca-certificates xz-utils \
+      libc6:amd64 libgcc-s1:amd64 \
+ && rm -rf /var/lib/apt/lists/*
+
+ARG RUST_VERSION=1.96.0
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --default-toolchain "${RUST_VERSION}" --profile minimal
+ENV PATH=/root/.cargo/bin:$PATH
+RUN rustup target add x86_64-unknown-linux-gnu
+
+# zig is the cgo cross C compiler/linker — one static download, no gcc-cross pkg.
+ARG ZIG_VERSION=0.13.0
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in amd64) za=x86_64;; arm64) za=aarch64;; *) echo "unsupported host $arch"; exit 1;; esac; \
+    curl -sSfL "https://ziglang.org/download/${ZIG_VERSION}/zig-linux-${za}-${ZIG_VERSION}.tar.xz" -o /tmp/zig.tar.xz; \
+    mkdir -p /opt/zig && tar -C /opt/zig --strip-components=1 -xf /tmp/zig.tar.xz && rm /tmp/zig.tar.xz; \
+    ln -s /opt/zig/zig /usr/local/bin/zig
+
+ENV GOFLAGS=-buildvcs=false
+WORKDIR /build

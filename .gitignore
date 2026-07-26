@@ -13,3 +13,7 @@
 # Go test/coverage artifacts. (Fuzz corpus under testdata/ IS committed.)
 *.test
 *.out
+
+# Windows/Wine harness artifacts (make test-wine / ci/wine-suite.sh).
+/sable_win_test.exe
+/.wineprefix/

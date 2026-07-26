@@ -615,7 +615,7 @@ certification. The OS-specific pieces are all *fd primitives*. The main one is t
 |---|---|---|
 | Linux | `eventfd` (counter-coalescing, one fd) | shipped, default |
 | macOS / BSD | **self-pipe** (`pipe(2)` + nonblocking; Go waits via kqueue) | **verified in CI** (`verify-macos`, full `make verify-all`) on Apple-Silicon |
-| Windows | IOCP-associated handle (see below) | follow-on; `windows-portable-tripwire` CI job (allowed to fail) tracks it |
+| Windows | anonymous **pipe** (`CreatePipe`; Go blocking-reads the read HANDLE) | portable fallback **built + run natively in CI** (`verify-windows`, windows/amd64); fast path is a follow-on |
 
 The Go dispatcher is doorbell-agnostic — it reads up to 8 bytes then drains the queue to
 empty — so switching primitives needs no Go change. The self-pipe path is **tested on
@@ -645,11 +645,18 @@ by the `verify-macos` CI job (where it is the default doorbell).
   (b) the `/proc/self/{fd,status}` fd/thread-leak assertions are Linux-only
   (`TestTeardownNoLeak` already `t.Skip`s off Linux; the fast-only stress/robust suites
   that read `/proc` are the rest).
-- **Windows (IOCP)** is the larger lift: there is no fd/self-pipe model, so the doorbell
-  needs a handle **associated with the runtime's IOCP** (likely a named pipe or loopback
-  socketpair Go can poll) — the real design work — and the asmcgocall/linkname surface plus
-  the fast-path P-retake/STW assumptions must be re-certified for `windows/amd64`. Until
-  then Windows runs the **portable fallback**, once its doorbell handle is implemented.
+- **Windows (portable fallback)** now **builds and runs** — the doorbell is an anonymous
+  **pipe** (`CreatePipe`; the write end set `PIPE_NOWAIT` so `ring()` never blocks the
+  executor, the read end left blocking), and because the portable build is zero-linkname the
+  Go dispatcher just **blocking-reads** the read HANDLE (`bridge_dup_windows.go` duplicates
+  it via `DuplicateHandle`; no IOCP association needed). Its suite is built and run
+  **natively on a `windows-latest` CI runner** (`verify-windows`, staticlib target
+  `x86_64-pc-windows-gnu` to match the runner's mingw gcc that cgo uses); for non-Windows dev
+  boxes `make test-wine` cross-compiles and runs the same suite under **Wine**.
+  Only `doorbell.rs` was `std::os::unix`-only in the portable path (`reactor.rs`/`goexec.rs`
+  and every other `RawFd` use are `#[cfg(feature = "fast")]`), so the fast path is the
+  remaining Windows lift: an IOCP-associated doorbell handle plus re-certifying the
+  asmcgocall/linkname surface and the P-retake/STW assumptions for `windows/amd64`.
 
 ### Architectures
 
@@ -686,6 +693,12 @@ CGO_ENABLED=1 GOARCH=amd64 CC="zig cc -target x86_64-linux-musl" \
   go test -race -ldflags '-linkmode external -extldflags "-static"' \
           -exec qemu-x86_64 ./...
 ```
+
+`make test-qemu-amd64` packages this as a one-command Docker harness (registers the
+qemu-user-static binfmt handlers via a pinned `tonistiigi/binfmt`, cross-compiles in a
+native-arch toolchain image — rustc/LLVM segfault *under* qemu, so only the resulting test
+binaries run emulated — and runs the fast + portable suites). It's a local dev aid: CI
+already covers amd64 natively, so there is no CI job for it. Race detector off (qemu).
 
 ## Build & run
 
